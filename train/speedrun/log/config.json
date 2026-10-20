@@ -9,7 +9,7 @@
   "overrides": [
     "seed=0",
     "num_iterations=975",
-    "data=logs/speedrun-147908/rows",
+    "data=logs/speedrun-148681/rows",
     "save_steps=975",
     "val_every=1000000"
   ]

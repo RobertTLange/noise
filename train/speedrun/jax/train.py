@@ -32,9 +32,9 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from kernels import exact_keys, head_ce, probe_cycle, relu2_matmul, residual_norm, rope_norm
+from kernels import exact_keys, exact_moments, head_ce, relu2_matmul, residual_norm, rope_norm
 
-SOURCES = (exact_keys, probe_cycle, head_ce, relu2_matmul, residual_norm, rope_norm)  # embedded in the run log
+SOURCES = (exact_keys, exact_moments, head_ce, relu2_matmul, residual_norm, rope_norm)  # embedded in the run log
 F32, BF16 = jnp.float32, jnp.bfloat16
 EVAL_CHUNK_ROWS = 4  # validation rows per forward chunk: 544 val rows = 8 GPUs x 17 chunks
 
@@ -55,7 +55,8 @@ class Hyperparameters:
     seq_warmup: str = "1024:780"  # e.g. "512:200,1024:400": 512-token rows until step 200 (the same tokens per update)
     # run
     num_iterations: int = 975
-    val_every: int = 100
+    steps_per_call: int = 15  # updates per dispatch (one compiled scan): the step boundaries below divide by it
+    val_every: int = 150
     target: float = 4.2
     save_every: int = 0  # latest checkpoint at logs/<run_id>.npz (0 disables)
     save_steps: str = ""  # steps whose checkpoints are kept at logs/<run_id>-<step>.npz, e.g. "300,975"
@@ -90,6 +91,11 @@ def parse_args(argv):
         setattr(hp, name, types[name](value))
     if hp.batch_size * hp.seq_len % 128 or any(t * hp.n_head % 64 or hp.seq_len % t for t, _ in seq_stages(hp)):
         raise SystemExit("kernels tile batch_size * seq_len by 128, row length * n_head by 64; lengths divide seq_len")
+    marks = [hp.num_iterations, *(until for _, until in seq_stages(hp)[:-1]), *(int(x) for x in hp.save_steps.split(",")
+                                                                                  if x)]
+    marks += [hp.val_every] if hp.val_every < hp.num_iterations else []
+    if any(mark % hp.steps_per_call for mark in marks):
+        raise SystemExit(f"steps_per_call={hp.steps_per_call} must divide the run's step boundaries {marks}")
     return hp
 
 
@@ -357,7 +363,7 @@ def coordinate_change(raw, targets, vocab, sigma):
 
 # ---------------------------------------------------------------------------------------------------------------------
 # Estimator
-# Identity-path credit (record #7, Noise PR #16), each GPU running it for 1 / shards of the tokens.
+# Identity-path credit (record #7, Noise PR #16), each GPU running it for its own rows of the batch.
 #
 # One readout cycle per update measures each token's credit at the top stream: the stream moves along every row of a
 # sign-flipped order-512 Hadamard matrix and the readout (norm, head, softcap, cross-entropy) is evaluated on each move.
@@ -365,8 +371,12 @@ def coordinate_change(raw, targets, vocab, sigma):
 # it), the embedding through the same path plus the x0 injections. Everything else is one local step from those
 # credits: the writers' gradients directly, the MLP hidden credit by one relu² slope per unit, the attention-output
 # targets as `credit @ W_projᵀ` (a linear map of measured credit doesn't count as a step), and from them the queries,
-# keys and values by single-coordinate experiments evaluated exactly (kernels/exact_keys.py), the gates by one sigmoid
-# slope. No credit is read back through a block's weights into the block below.
+# keys and values by single-coordinate experiments evaluated exactly (kernels/exact_keys.py, exact_moments.py), the
+# gates by one sigmoid slope. No credit is read back through a block's weights into the block below.
+#
+# The work split: each GPU runs the clean forward pass on its own rows (in the 2048-token phase, the row it shares
+# with a neighbour) and the estimate for its own tokens; for the queries, keys and values each GPU takes one head over
+# the whole batch, its inputs and targets brought by all-to-all.
 
 
 EPS = float(np.finfo(np.float32).eps)  # the readout norm's epsilon (torch's rms_norm default)
@@ -376,7 +386,8 @@ KEY_SIGMA = 0.003  # the query / key coordinate step, relative to the raw query'
 HEAD_SIGMA = 0.1  # the head's logit step
 GATE_STEP = 0.1  # the gates' central-difference step on the gate logit
 TOKEN_CHUNK = 1024  # tokens per readout-cycle chunk
-PROBE_TILES = {"block_rows": 64, "block_dirs": 8, "block_vocab": 128, "num_warps": 8, "num_stages": 1}
+MOMENT_DEGREE = 2  # the exact query / key experiments' polynomial in the logit change (kernels/exact_moments.py)
+CHUNK = 16  # query / key directions per moment-kernel chunk
 
 
 def hadamard(d):
@@ -392,28 +403,41 @@ def flipped(key, d):
     return hadamard(d) * jax.random.rademacher(key, (d,), F32)
 
 
-def my_rows(matrix, shards, axis=0):
-    """This GPU's 1 / shards of `matrix` along `axis`."""
-    per = matrix.shape[axis] // shards
-    return jax.lax.dynamic_slice_in_dim(matrix, jax.lax.axis_index("pop") * per, per, axis)
-
-
 def cycle_derivatives(base, c, y, steps, sq, dots, dir_sq, width):
     """Forward differences of each token's readout loss along every direction j of a cycle: (moved - clean) / step.
     base (n, V) the clean raw logits; c (P, V) row j the logits of direction j; steps (n, 1); sq (n, 1) |x|^2;
     dots (n, P) x . D_j; dir_sq (P,) |D_j|^2. The moved stream's RMS comes from these, so the head's norm is exact.
-    The partition functions come from kernels/probe_cycle.py (no [n, P, V] logits); the clean one runs through the
-    kernel too (as zero directions), so its approximation errors cancel in the differences."""
+
+    Each moved stream's partition function from moments on tensor cores: moving along direction j changes token n's
+    soft-capped head input z_v = inv0 base_v by e_jv = delta_j z_v + sigma_j c_jv (delta_j = inv_j / inv0 - 1,
+    sigma_j = step inv_j), and f(z) = exp(15 tanh(z / 15)) has f(z + e) / f(z) = 1 + g1 e + g2 e^2 / 2 + g3 e^3 / 6
+    with g1..g3 functions of z alone. So sum_v f(z_v + e_jv) splits into sums over v of f z^a g_k (per token) times
+    c_jv^b (per direction): six [n, V] x [V, P] products (the first-order one in fp32) and three row sums. |e| <~ 0.02,
+    so the dropped terms are ~1e-8 of the total; the moved difference comes out directly (log1p of the ratio)."""
     inv = jax.lax.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
     inv0 = jax.lax.rsqrt(sq / width + EPS)
-    clean_dirs = PROBE_TILES["block_dirs"]
-    totals = probe_cycle.partitions(base, jnp.pad(c, ((0, clean_dirs), (0, 0))), steps,
-                                    jnp.concatenate([inv, jnp.tile(inv0, (1, clean_dirs))], 1), **PROBE_TILES)
-    partitions = jnp.log(totals)
+    delta, sigma = inv / inv0 - 1, steps * inv  # (n, P)
+    z = base * inv0  # (n, V)
+    t = jnp.tanh(z / SOFTCAP)
+    f = jnp.exp(SOFTCAP * t)
+    g1 = 1 - t * t  # derivatives of log f: g1, d1, d2
+    d1 = -2 * t * g1 / SOFTCAP
+    d2 = -2 * g1 * (1 - 3 * t * t) / SOFTCAP ** 2
+    g2, g3 = g1 * g1 + d1, g1 * g1 * g1 + 3 * g1 * d1 + d2  # second and third derivatives of f, over f
+    total = jnp.sum(f, -1, keepdims=True)  # the clean partition function
+    exact = lambda w, cols: jnp.dot(w, cols.T, precision=jax.lax.Precision.HIGHEST)
+    fast = lambda w, cols: jnp.dot(w.astype(BF16), cols.astype(BF16).T, preferred_element_type=F32)
+    rows = lambda w: jnp.sum(w, -1, keepdims=True)
+    fz, fzz = f * z, f * z * z
+    ratio = (sigma * exact(f * g1, c) + delta * sigma * fast(fz * g2, c) + 0.5 * delta ** 2 * sigma * fast(fzz * g3, c)
+             + 0.5 * sigma ** 2 * fast(f * g2, c * c) + 0.5 * delta * sigma ** 2 * fast(fz * g3, c * c)
+             + sigma ** 3 / 6 * fast(f * g3, c * c * c)
+             + delta * rows(fz * g1) + 0.5 * delta ** 2 * rows(fzz * g2) + delta ** 3 / 6 * rows(fzz * z * g3))
+    clean_partition = jnp.log(total)
     base_y = jnp.take_along_axis(base, y[:, None], axis=1)
     dirs_y = c.T[y]  # (n, P)
-    clean = partitions[:, -1:] - softcap(base_y * inv0)
-    moved = partitions[:, :-clean_dirs] - softcap((base_y + steps * dirs_y) * inv)
+    clean = clean_partition - softcap(base_y * inv0)
+    moved = clean_partition + jnp.log1p(ratio / total) - softcap((base_y + steps * dirs_y) * inv)
     return (moved - clean) / steps
 
 
@@ -456,120 +480,161 @@ def rope32(x, cos, sin):
     return rotated * jax.lax.rsqrt(jnp.mean(rotated * rotated, axis=-1, keepdims=True) + 1e-6)
 
 
-def exact_blocks(q_raw, k_raw, values, hub, window, rope, shards, clean_attention=None):
-    """Query and key credit by single-coordinate experiments, each evaluated exactly: the raw key (query) at position
-    t moves by step_t e_j and nothing else moves. A key move changes each query's output in one term,
-    o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'), a' = a exp(dl); a query move reweights its own output's keys. Each
-    change is scored against the query's attention-output credit (hub_s . (o'_s - o_s)): one local step. The sums run
-    in kernels/exact_keys.py from cuDNN's clean log-sum-exp and output; each GPU takes 1 / shards of the dimensions j.
-    Returns (the values' exact credit sum_s A[s, t] hub_s (b, t, h, d), whole; {q, k: this GPU's block of dims
-    (b, h, t, d / shards)}). `clean_attention`: the clean pass's (output, log-sum-exp), else recomputed."""
-    b, t, h, hd = k_raw.shape
+def local_clean(cfg, params, idx, targets, shards):
+    """The clean pass on this GPU's rows, and `mine`: an array of that pass [rows, t, ...] -> this GPU's tokens
+    (m, ...), the batch's tokens split evenly in order. Rows divide over the GPUs, or GPUs over rows (each GPU then
+    runs its whole row and keeps its part)."""
+    b, t = idx.shape
+    g = jax.lax.axis_index("pop")
+    if b % shards == 0:
+        rows = b // shards
+        take = lambda a: jax.lax.dynamic_slice_in_dim(a, g * rows, rows, 0)
+        mine = lambda a: a.reshape(rows * t, -1)
+    elif shards % b == 0:
+        per = shards // b
+        part = t // per
+        take = lambda a: jax.lax.dynamic_slice_in_dim(a, g // per, 1, 0)
+        mine = lambda a: jax.lax.dynamic_slice_in_dim(a.reshape(t, -1), (g % per) * part, part, 0)
+    else:
+        raise SystemExit(f"the rows ({b}) and the GPUs ({shards}) must divide one another")
+    return clean_pass(cfg, params, take(idx), take(targets)), mine
+
+
+def gathered_heads(clean, targets, mine):
+    """Every block's inputs for this GPU's head over the whole batch, from this GPU's rows of the clean pass and its
+    tokens' attention-output targets [layers, m, d], in one bf16 all-to-all (the queries, keys, values, clean attention
+    outputs and targets are bf16 already; the log-sum-exp travels as its fp32 bits). Per block: (q_raw, k_raw, values,
+    out, hub [b, t, hd], lse [b, t])."""
+    cfg, cache = clean.cfg, clean.cache
+    h, hd, t = cfg.n_head, cfg.head_dim, clean.idx.shape[1]
+    heads_of = lambda x: x.reshape(-1, h, hd).astype(BF16)  # this GPU's tokens (m, d) -> (m, h, hd)
+    own = lambda x: heads_of(mine(x))
+    parts = []
+    for i in range(cfg.n_layer):
+        pre = f"h{i}."
+        values = cache[pre + "attn.c_v"].astype(F32)
+        if cfg.has_ve(i):
+            z = cache[pre + "attn.ve_gate"].astype(F32)
+            ve = cache[f"ve{i}"].astype(F32).reshape(*z.shape, hd)
+            values = values + (2 * jax.nn.sigmoid(z)[..., None] * ve).reshape(values.shape)
+        lse = mine(jnp.swapaxes(cache[pre + "attn.lse"].astype(F32), 1, 2))  # (m, h)
+        parts.append(jnp.concatenate([own(cache[pre + "attn.c_q"]), own(cache[pre + "attn.c_k"]), own(values),
+                                      own(cache[pre + "attn.out"]), heads_of(targets[i]),
+                                      jax.lax.bitcast_convert_type(lse, BF16)], -1))  # (m, h, 5 hd + 2)
+    whole = jax.lax.all_to_all(jnp.stack(parts), "pop", 2, 1, tiled=True)  # [layers, n, 1, 5 hd + 2]
+    whole = whole.reshape(cfg.n_layer, -1, t, whole.shape[-1])  # [layers, b, t, 5 hd + 2]
+    kinds = lambda x: [x[..., j * hd:(j + 1) * hd].astype(F32) for j in range(5)]
+    lse_of = lambda x: jax.lax.bitcast_convert_type(x[..., 5 * hd:], F32)
+    return [(*kinds(whole[i]), lse_of(whole[i])) for i in range(cfg.n_layer)]
+
+
+def head_credits(q_raw, k_raw, values, out, hub, lse, rope, window):
+    """One head's exact query, key and value credits over the whole batch, every dimension: q_raw, k_raw, values,
+    out (the clean attention output), hub [b, t, hd], lse [b, t] -> [3, b t, 1, hd].
+
+    A key move changes each query's output in one term, o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'),
+    a' = a exp(dl); a query move reweights its own output's keys. Each change is scored against the query's
+    attention-output credit (hub_s . (o'_s - o_s)): one local step. The values' credit is A^T hub, exactly."""
+    b, t, hd = q_raw.shape
     cos, sin = rope
-    qp, kp = rope32(q_raw, cos, sin), rope32(k_raw, cos, sin)
-    out, lse = clean_attention or attention_with_lse(qp, kp, values, window)  # out [b, t, h, d], lse [b, h, t]
-    hub_out = jnp.swapaxes(jnp.sum(hub * out.astype(F32), -1), 1, 2).reshape(b * h, t)
-    lse = lse.astype(F32).reshape(b * h, t)
-    per = hd // shards
-    dims = jax.lax.axis_index("pop") * per + jnp.arange(per)  # this GPU's block of dims j
-    rows = lambda x: jnp.swapaxes(x, 1, 2).reshape(b * h, t, hd)  # [b, t, h, d] -> [b h, t, d]
-    clean = rows(qp), rows(kp), rows(values), rows(hub)
+    q1, k1 = (rope32(x[:, :, None], cos, sin)[:, :, 0] for x in (q_raw, k_raw))
+    hub_out = jnp.sum(hub * out, -1)
     rotation = cos.reshape(t, hd // 2), sin.reshape(t, hd // 2)
-    chunk = min(per, 8)  # directions per kernel call
+    dims = jnp.arange(hd)
+    chunks = hd // CHUNK
 
-    def credit(raw, other, kernel, coef_axes, cols_axes):
-        """This GPU's block [b, h, t, per] of a kind's credit: `other` the other side's processed rows, *_axes the
-        (direction, position) axes each kernel input takes for the coefficients [b h, 3, ., .] and columns."""
-        coef, steps = exact_keys.closed_coefficients(rows(raw), *rotation, dims, KEY_SIGMA)  # [b h, 3, t, per]
-        coef = jnp.moveaxis(coef, (3, 2), coef_axes)
-        cols = jnp.moveaxis(exact_keys.rotated_columns(other, dims), (3, 2), cols_axes)  # from [b h, 2, t, per]
-        part = lambda x, axis, j: jax.lax.slice_in_dim(x, j, j + chunk, axis=axis)
-        score = jnp.concatenate([kernel(*clean, part(coef, coef_axes[0], j), part(cols, cols_axes[0], j), lse,
-                                        hub_out, window) for j in range(0, per, chunk)], -1)
-        return score.reshape(b, h, t, per) / steps.reshape(b, h, t, 1)
+    def credit(raw, other, kernel):  # [b, t, hd]; the chunks of directions ride in the kernel's batch axis
+        coef, steps = exact_keys.closed_coefficients(raw, *rotation, dims, KEY_SIGMA)  # [b, 3, t, hd]
+        cols = exact_keys.rotated_columns(other, dims)  # [b, 2, t, hd]
+        batch = lambda x: jnp.moveaxis(x.reshape(*x.shape[:-1], chunks, CHUNK), -2, 1).reshape(-1, *x.shape[1:-1],
+                                                                                                CHUNK)
+        score = kernel(q1, k1, values, hub, batch(coef), batch(cols), lse, hub_out, window, degree=MOMENT_DEGREE,
+                       repeat=chunks)  # [b chunks, t, CHUNK]
+        return jnp.moveaxis(score.reshape(b, chunks, t, CHUNK), 1, 2).reshape(b, t, hd) / steps
 
-    value_credit = jnp.swapaxes(exact_keys.value_credit(clean[0], clean[1], clean[3], lse, window).reshape(
-        b, h, t, hd), 1, 2)  # [b, t, h, d]
-    blocks = {
-        "q": credit(q_raw, clean[1], exact_keys.closed_query_scores, (3, 2), (2, 3)),  # key columns [., J, T]
-        "k": credit(k_raw, clean[0], exact_keys.closed_scores, (2, 3), (3, 2)),  # key coefficients [., J, T]
-    }
-    return value_credit, blocks
+    q = credit(q_raw, k1, exact_moments.moment_query_scores)
+    k = credit(k_raw, q1, exact_moments.moment_scores)
+    v = exact_keys.value_credit(q1, k1, hub, lse, window)
+    return jnp.stack([q, k, v]).reshape(3, b * t, 1, hd)
 
 
-def attention_credit(clean, put, i, hub, rope, mine, shards):
-    """Layer i's queries, keys, values, gates and value embeddings, one local step from its attention-output targets
-    `hub` (n, d), whole: this GPU's tokens' errors go to `put`."""
-    cfg, cache, pre = clean.cfg, clean.cache, f"h{i}."
-    b, t = clean.idx.shape
-    h, hd = cfg.n_head, cfg.head_dim
-    q_raw, k_raw, v_raw = (cache[pre + f"attn.c_{s}"].astype(F32).reshape(b, t, h, hd) for s in "qkv")
-    values, z, ve = v_raw, None, None
-    if cfg.has_ve(i):
-        z, ve = cache[pre + "attn.ve_gate"].astype(F32), cache[f"ve{i}"].astype(F32).reshape(b, t, h, hd)
-        values = values + 2 * jax.nn.sigmoid(z)[..., None] * ve
-    clean_attention = (cache[pre + "attn.out"], cache[pre + "attn.lse"]) if pre + "attn.lse" in cache else None
-    value_credit, blocks = exact_blocks(q_raw, k_raw, values, hub.reshape(b, t, h, hd), cfg.window(i), rope, shards,
-                                        clean_attention)
-    stacked = jnp.swapaxes(jnp.stack([blocks["q"], blocks["k"]]), 2, 3).reshape(2, b * t, h, -1)  # [2, n, h, hd / s]
-    by_token = jax.lax.all_to_all(stacked, "pop", 1, 3, tiled=True).reshape(2, -1, h * hd)  # [2, m, d]
-    errors = {"q": by_token[0], "k": by_token[1], "v": mine(value_credit)}
-    for kind in "qkv":
-        put(pre + f"attn.c_{kind}", errors[kind])
-    if cfg.has_ve(i):
-        z, ve = mine(z), mine(ve).reshape(-1, h, hd)
-        credit = errors["v"].reshape(-1, h, hd)
-        slope = (jax.nn.sigmoid(z + GATE_STEP) - jax.nn.sigmoid(z - GATE_STEP)) / GATE_STEP
-        put(pre + "attn.ve_gate", slope * jnp.sum(credit * ve, -1))
-        put(f"ve{i}", (credit * 2 * jax.nn.sigmoid(z)[..., None]).reshape(-1, h * hd))
+def batched_products(deferred):
+    """[(sites, their weight gradients [k, in, out])] from the deferred (site, input (m, in), error (m, out)): one
+    batched input.T @ error product per shape."""
+    groups = {}
+    for site, x, error in deferred:
+        groups.setdefault((x.shape[1], error.shape[1]), []).append((site, x, error))
+    return [([site for site, _, _ in group],
+             jnp.einsum("kmi,kmo->kio", jnp.stack([x for _, x, _ in group]), jnp.stack([e for _, _, e in group])))
+            for group in groups.values()]
 
 
 def identity_grad(cfg, params, idx, targets, key, shards):
-    """(The identity-path gradient estimate, the mean clean token loss), inside shard_map over the 'pop' axis: the top
-    cycle (all directions) on this GPU's tokens, the MLP steps on them, and its share of every weight gradient. Per
-    block, the attention-output credit is gathered for the exact query, key and value kernels (which split the head
-    dimensions) and their query and key credits come back by token (an all-to-all); the gradients are summed over the
-    GPUs once."""
-    clean = clean_pass(cfg, params, idx, targets)
-    cache, (b, t), vocab = clean.cache, idx.shape, cfg.vocab_size
-    n, layers = b * t, cfg.n_layer
+    """(The identity-path gradient estimate, the mean clean token loss), inside shard_map over the 'pop' axis. Each
+    GPU: the clean pass on its rows, the top cycle (all directions) and the MLP steps on its tokens, one head's
+    queries, keys and values over the batch (`gathered_heads`, `head_credits`; their credits back by token in one
+    all-to-all), and its share of every weight gradient. The block matrices' gradients stay this GPU's partial sums
+    (`anvil_blocks` reduce-scatters them); the rest are summed over the GPUs here."""
+    if jax.lax.axis_size("pop") != cfg.n_head:
+        raise SystemExit(f"the exact internals run one head per GPU: {cfg.n_head} GPUs")
+    (b, t), vocab = idx.shape, cfg.vocab_size
+    n, layers, h = b * t, cfg.n_layer, cfg.n_head
+    clean, mine = local_clean(cfg, params, idx, targets, shards)
+    cache = clean.cache
     rope = rotary(cfg, t)
-    mine = lambda a: my_rows(a.reshape(n, -1), shards)  # this GPU's tokens
     stream = lambda name: mine(cache[name].astype(F32))
-    y, tokens = mine(targets)[:, 0], mine(idx)[:, 0]
+    y, tokens = mine(clean.targets)[:, 0], mine(clean.idx)[:, 0]
     grads = jax.tree.map(lambda p: jnp.zeros(p.shape, F32), params)
+    deferred = []  # (site, input, error) of the matrices: one batched product per shape at the end
 
     def put(site, error):
         if site == "wte" or site.startswith("ve"):
-            value = jnp.zeros((cfg.padded_vocab, error.shape[-1]), F32).at[tokens].add(error)
+            set_grad(grads, site, jnp.zeros((cfg.padded_vocab, error.shape[-1]), F32).at[tokens].add(error))
+        elif site.endswith("ve_gate"):
+            set_grad(grads, site, mine(site_input(clean, site)).astype(F32).T @ error)
         else:
-            value = mine(site_input(clean, site)).astype(F32).T @ error
-        set_grad(grads, site, value)
+            deferred.append((site, mine(site_input(clean, site)).astype(F32), error))
 
     coordinates = coordinate_change(mine(cache["lm_head"]), y, vocab, HEAD_SIGMA)
     grads["lm_head"] = mine(cache["in.lm_head"]).astype(F32).T @ coordinates
-    credit_out = top_credit(params, jax.random.split(key)[0], stream(f"h{layers - 1}.out"), y, vocab)
+    credit_top = top_credit(params, jax.random.split(key)[0], stream(f"h{layers - 1}.out"), y, vocab)
     lam_r, lam_0 = params["resid_lambdas"].astype(F32), params["x0_lambdas"].astype(F32)
     x0 = stream("x0")
-    credit_x0 = jnp.zeros_like(x0)
-    scalars = jnp.zeros((2, layers), F32)
-    for i in reversed(range(layers)):  # credit_out: the credit of block i's output stream
+    above = jnp.cumprod(lam_r[::-1])[::-1]  # above[i] = lam_r[i] * ... * lam_r[last]
+    credits = [credit_top * (above[i + 1] if i + 1 < layers else 1.0) for i in range(layers)]  # block outputs'
+    for i, credit in enumerate(credits):
         w, pre = params["blocks"][i], f"h{i}."
-        put(pre + "mlp.c_proj", credit_out)
-        put(pre + "mlp.c_fc", hidden_credit(stream(pre + "mlp.c_fc"), credit_out, w["mlp.c_proj"]))
-        put(pre + "attn.c_proj", credit_out)
-        hub = jax.lax.all_gather((credit_out @ w["attn.c_proj"].astype(F32).T).astype(BF16), "pop", axis=0,
-                                 tiled=True).astype(F32)  # bf16: the exact kernels read it in bf16
-        attention_credit(clean, put, i, hub, rope, mine, shards)
+        put(pre + "mlp.c_proj", credit)
+        put(pre + "mlp.c_fc", hidden_credit(stream(pre + "mlp.c_fc"), credit, w["mlp.c_proj"]))
+        put(pre + "attn.c_proj", credit)
+    targets_o = jnp.stack([(credit @ params["blocks"][i]["attn.c_proj"].astype(F32).T).astype(BF16)
+                           for i, credit in enumerate(credits)])  # attention-output targets; bf16 as the kernels read
+    heads = gathered_heads(clean, targets_o, mine)
+    stacked = jnp.stack([head_credits(*heads[i], rope, cfg.window(i)) for i in range(layers)])  # [L, 3, n, 1, hd]
+    by_token = jax.lax.all_to_all(stacked, "pop", 2, 3, tiled=True)  # [L, 3, m, h, hd]
+    by_token = by_token.reshape(layers, 3, by_token.shape[2], h * cfg.head_dim)
+    scalars = []
+    for i, credit in enumerate(credits):
+        pre = f"h{i}."
+        for j, kind in enumerate("qkv"):
+            put(pre + f"attn.c_{kind}", by_token[i, j])
+        if cfg.has_ve(i):
+            z = mine(cache[pre + "attn.ve_gate"].astype(F32))  # (m, h)
+            ve = mine(cache[f"ve{i}"].astype(F32)).reshape(-1, h, cfg.head_dim)
+            value_credit = by_token[i, 2].reshape(-1, h, cfg.head_dim)
+            slope = (jax.nn.sigmoid(z + GATE_STEP) - jax.nn.sigmoid(z - GATE_STEP)) / GATE_STEP
+            put(pre + "attn.ve_gate", slope * jnp.sum(value_credit * ve, -1))
+            put(f"ve{i}", (value_credit * 2 * jax.nn.sigmoid(z)[..., None]).reshape(-1, h * cfg.head_dim))
         prev = x0 if i == 0 else stream(f"h{i - 1}.out")
-        scalars = scalars.at[:, i].set(jnp.stack([jnp.sum(credit_out * prev), jnp.sum(credit_out * x0)]))
-        credit_x0 = credit_x0 + lam_0[i] * credit_out
-        credit_out = lam_r[i] * credit_out  # down the residual path to block i - 1's output
-    credit_x0 = credit_x0 + credit_out  # block 0 reads x0 as its previous stream too
-    put("wte", credit_x0)
-    grads["resid_lambdas"], grads["x0_lambdas"] = scalars[0], scalars[1]
-    grads = jax.tree.map(lambda g, p: (jax.lax.psum(g, "pop") / n).astype(p.dtype), grads, params)
-    return grads, clean.loss.mean()
+        scalars.append(jnp.stack([jnp.sum(credit * prev), jnp.sum(credit * x0)]))
+    put("wte", sum(lam_0[i] * credit for i, credit in enumerate(credits)) + lam_r[0] * credits[0])  # x0's credit
+    for sites, value in batched_products(deferred):
+        for site, g in zip(sites, value, strict=True):
+            set_grad(grads, site, g)
+    grads["resid_lambdas"], grads["x0_lambdas"] = jnp.stack(scalars, axis=1)
+    summed = lambda path, g: g if anvil_leaf(path) else jax.lax.psum(g, "pop")
+    grads = jax.tree_util.tree_map_with_path(lambda path, g, p: (summed(path, g) / n).astype(p.dtype), grads, params)
+    return grads, jax.lax.pmean(mine(clean.loss).mean(), "pop")
 
 
 # ---------------------------------------------------------------------------------------------------------------------
@@ -619,15 +684,23 @@ def init_optimizer(params):
     return {"m": zeros(), "v": zeros(), "anvil": anvil}
 
 
+def anvil_leaf(path):
+    """Whether a parameter-tree path is a block matrix ANVIL II steps."""
+    return str(getattr(path[0], "key", path[0])) == "blocks" and str(getattr(path[-1], "key", "")) in ANVIL_KINDS
+
+
 def adam_update(params, grads, moments, rates, step_index, hp):
-    """torch.optim.Adam without weight decay: bias-corrected moments, step_index counting from 0."""
+    """torch.optim.Adam without weight decay: bias-corrected moments, step_index counting from 0. The matrices ANVIL
+    II steps keep their weights and (unused) moments."""
     t = step_index.astype(F32) + 1
     correction1, correction2 = 1 - hp.beta1**t, 1 - hp.beta2**t
-    m = jax.tree.map(lambda m, g: hp.beta1 * m + (1 - hp.beta1) * g.astype(F32), moments["m"], grads)
-    v = jax.tree.map(lambda v, g: hp.beta2 * v + (1 - hp.beta2) * jnp.square(g.astype(F32)), moments["v"], grads)
+    adam = lambda f: lambda path, old, *xs: old if anvil_leaf(path) else f(old, *xs)
+    with_path = jax.tree_util.tree_map_with_path
+    m = with_path(adam(lambda m, g: hp.beta1 * m + (1 - hp.beta1) * g.astype(F32)), moments["m"], grads)
+    v = with_path(adam(lambda v, g: hp.beta2 * v + (1 - hp.beta2) * jnp.square(g.astype(F32))), moments["v"], grads)
     direction = lambda m, v: m / correction1 / (jnp.sqrt(v) / jnp.sqrt(correction2) + hp.adam_eps)
     directions = jax.tree.map(direction, m, v)
-    params = jax.tree.map(lambda p, d, lr: (p.astype(F32) - lr * d).astype(p.dtype), params, directions, rates)
+    params = with_path(adam(lambda p, d, lr: (p.astype(F32) - lr * d).astype(p.dtype)), params, directions, rates)
     return params, {"m": m, "v": v}
 
 
@@ -726,8 +799,9 @@ def owned_slice(count, shards):
 
 def anvil_blocks(blocks, grads, states, lr, step_index, hp, shards):
     """The block matrices' ANVIL II steps (from the weights before this step) and the new states: one batched update
-    per wide shape. Each GPU steps its share of a group (the gradients are the same on every GPU), the new weights
-    are gathered, and each GPU keeps only its share's states current (`gather_anvil_states` collects them)."""
+    per wide shape. `grads` are each GPU's partial sums: one reduce-scatter per group gives each GPU the summed
+    gradients of its share, it steps them, the new weights are gathered, and each GPU keeps only its share's states
+    current (`gather_anvil_states` collects them)."""
     betas = anvil_betas(step_index, hp.num_iterations)
     layers = len(blocks)
     stepped, new_states = [{} for _ in blocks], [{} for _ in blocks]
@@ -737,8 +811,10 @@ def anvil_blocks(blocks, grads, states, lr, step_index, hp, shards):
         mine = lambda x, first=first, per=per: jax.lax.dynamic_slice_in_dim(x, first, per, 0)
         old = group_stack(states, kinds, talls)
         update = jax.vmap(lambda w, g, st, rate: anvil_step(w, g, st, lr, betas, hp.anvil_wd, rate))
-        w, st = update(mine(group_stack(blocks, kinds, talls)), mine(group_stack(grads, kinds, talls)),
-                       jax.tree.map(mine, old), mine(rates))
+        if per == len(kinds) * layers:
+            raise SystemExit(f"ANVIL's groups must split across the GPUs ({kinds})")
+        summed = jax.lax.psum_scatter(group_stack(grads, kinds, talls), "pop", scatter_dimension=0, tiled=True)
+        w, st = update(mine(group_stack(blocks, kinds, talls)), summed, jax.tree.map(mine, old), mine(rates))
         if per < len(kinds) * layers:
             w = jax.lax.all_gather(w, "pop", axis=0, tiled=True)
             st = jax.tree.map(lambda full, part, first=first: jax.lax.dynamic_update_slice_in_dim(full, part, first, 0),
@@ -783,6 +859,9 @@ def train_batches(rows, batch_size, seed, max_epochs):
 
 
 def make_train_step(cfg, hp, mesh):
+    """steps_per_call updates in one compiled call: idx, targets [K, rows, T], step_index, scale [K] -> (params,
+    buffers, the K updates' losses). One dispatch per K updates keeps the host's per-call cost (hundreds of state
+    arrays on 8 GPUs) off the update's critical path."""
     shards = mesh.size
 
     def step(params, buffers, idx, targets, step_index, scale):
@@ -790,12 +869,20 @@ def make_train_step(cfg, hp, mesh):
         grads, loss = identity_grad(cfg, params, idx, targets, key, shards)
         rates = jax.tree.map(lambda lr: scale * lr, learning_rates(params, hp))
         stepped, anvil = anvil_blocks(params["blocks"], grads["blocks"], buffers["anvil"], scale * hp.anvil_lr,
-                                            step_index, hp, shards)
+                                      step_index, hp, shards)
         params, state = adam_update(params, grads, buffers, rates, step_index, hp)
         params["blocks"] = [b | s for b, s in zip(params["blocks"], stepped, strict=True)]  # ANVIL's block matrices
         return params, state | {"anvil": anvil}, loss
 
-    sharded = jax.shard_map(step, mesh=mesh, in_specs=(P(),) * 6, out_specs=(P(),) * 3, check_vma=False)
+    def steps(params, buffers, idx, targets, step_index, scale):
+        def update(state, batch):
+            params, buffers, loss = step(*state, *batch)
+            return (params, buffers), loss
+
+        (params, buffers), losses = jax.lax.scan(update, (params, buffers), (idx, targets, step_index, scale))
+        return params, buffers, losses
+
+    sharded = jax.shard_map(steps, mesh=mesh, in_specs=(P(),) * 6, out_specs=(P(),) * 3, check_vma=False)
     return jax.jit(sharded, donate_argnums=(0, 1))
 
 
@@ -879,14 +966,17 @@ def main():
     gather_states = jax.jit(jax.shard_map(lambda st: gather_anvil_states(st, mesh.size), mesh=mesh,
                                           in_specs=P(), out_specs=P(), check_vma=False))
     step_fn = make_train_step(cfg, hp, mesh)
-    dummy = lambda length: put(np.zeros((hp.batch_size * hp.seq_len // length, length), np.int32))
+    calls = hp.steps_per_call
+    dummy = lambda length: put(np.zeros((calls, hp.batch_size * hp.seq_len // length, length), np.int32))
+    schedule = lambda first: (jnp.arange(first, first + calls, dtype=jnp.int32),
+                              jnp.asarray([lr_scale(s, hp) for s in range(first, first + calls)], F32))
     compile_start = time.perf_counter()
     lengths = sorted({seq_length(s, hp) for s in range(hp.num_iterations)})
-    train_steps = {length: step_fn.lower(params, buffers, dummy(length), dummy(length), jnp.int32(0),
-                                         jnp.float32(1)).compile() for length in lengths}
+    train_steps = {length: step_fn.lower(params, buffers, dummy(length), dummy(length), *schedule(0)).compile()
+                   for length in lengths}
     for length, compiled in train_steps.items():  # first runs (CUDA graphs, collectives' setup) on copies
         jax.block_until_ready(compiled(jax.tree.map(jnp.copy, params), jax.tree.map(jnp.copy, buffers),
-                                       dummy(length), dummy(length), jnp.int32(0), jnp.float32(1)))
+                                       dummy(length), dummy(length), *schedule(0)))
     evaluate = make_evaluate(cfg, mesh).lower(params, val_rows).compile()
     val_loss_of = lambda p: float(evaluate(p, val_rows)) / val_tokens
     print0(f"compiled in {time.perf_counter() - compile_start:.0f}s")
@@ -898,12 +988,14 @@ def main():
     segment_start = None  # wall clock at the first update dispatched since the last sync point (timed stretch)
     pending = None  # (step, loss on device) of the last dispatched update, logged once the next one is in flight
 
-    def log_update(done, loss, elapsed):
-        loss = float(loss)
-        print0(f"step:{done}/{hp.num_iterations} train_loss:{loss:.4f} train_time:{elapsed * 1000:.0f}ms "
-               f"step_avg:{elapsed * 1000 / done:.2f}ms")
-        if not math.isfinite(loss):
-            raise SystemExit("non-finite train loss")
+    def log_update(done, losses, elapsed):
+        """Log the K updates ending at `done` (their losses come back together)."""
+        losses = np.asarray(losses, np.float64)
+        for update, loss in enumerate(losses, start=done - len(losses) + 1):
+            print0(f"step:{update}/{hp.num_iterations} train_loss:{loss:.4f} train_time:{elapsed * 1000:.0f}ms "
+                   f"step_avg:{elapsed * 1000 / update:.2f}ms")
+            if not math.isfinite(loss):
+                raise SystemExit("non-finite train loss")
 
     def sync(train_time, segment_start, pending):
         """End a timed stretch: wait for its updates, add its wall time, log the last update. (train_time, None, None)"""
@@ -929,7 +1021,7 @@ def main():
         if last:
             break
         try:
-            inputs, targets = next(batches)
+            chunk = [next(batches) for _ in range(calls)]
         except StopIteration:
             print0(f"end of training data: max_epochs={hp.max_epochs} epochs of {len(train_rows)} rows")
             exhausted = True
@@ -937,10 +1029,10 @@ def main():
         if segment_start is None:
             segment_start = time.perf_counter()
         length = seq_length(step, hp)
-        inputs, targets = put(inputs.reshape(-1, length)), put(targets.reshape(-1, length))  # rows cut into pieces
-        params, buffers, loss = train_steps[length](params, buffers, inputs, targets, jnp.int32(step),
-                                                    jnp.float32(lr_scale(step, hp)))
-        step += 1
+        inputs = put(np.stack([x.reshape(-1, length) for x, _ in chunk]))  # [K, rows, length]: rows cut into pieces
+        targets = put(np.stack([y.reshape(-1, length) for _, y in chunk]))
+        params, buffers, loss = train_steps[length](params, buffers, inputs, targets, *schedule(step))
+        step += calls
         if pending:  # the previous update's loss: waits for it only, while this one runs
             log_update(*pending, train_time + time.perf_counter() - segment_start)
         pending = (step, loss)

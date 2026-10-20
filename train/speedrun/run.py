@@ -1,12 +1,13 @@
 """Track 2: reach validation loss TARGET on 8xH100 in the shortest time, without backpropagation (JAX).
 
 Identity-path credit, as the previous record, in JAX (`jax/train.py`, see `jax/README.md`): one Hadamard cycle
-measures each token's credit at the top stream (its partition functions in a Pallas kernel), every earlier stream
-gets it through the residual path, and every site takes one local step from it: the writers directly, the MLP hidden
-layer for every unit (relu² slope times `credit @ W_outᵀ`), the queries and keys by single-coordinate experiments
-evaluated exactly in fused kernels (each logit change in closed form), the values, gates and value embeddings in
-closed form. Each GPU runs it for its share of the tokens; ANVIL II steps the block matrices batched by shape and
-split across the GPUs.
+measures each token's credit at the top stream (its partition functions from moments on tensor cores), every earlier
+stream gets it through the residual path, and every site takes one local step from it: the writers directly, the MLP
+hidden layer for every unit (relu² slope times `credit @ W_outᵀ`), the queries and keys by single-coordinate
+experiments evaluated exactly (each logit change in closed form, the sums as attention-weighted moments on tensor
+cores), the values, gates and value embeddings in closed form. Each GPU runs the clean pass and the estimate for its
+own rows and one head's queries, keys and values over the batch; ANVIL II steps the block matrices batched by shape
+and split across the GPUs.
 
 This script keeps the benchmark's harness: it reads the pinned `data/train.pt` and `data/val.pt` (utils/prepare_data),
 trains with the JAX trainer in a subprocess (one process, 8 GPUs; the timer runs from the first update to the end of
