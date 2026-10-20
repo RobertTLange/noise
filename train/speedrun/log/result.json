@@ -1,7 +1,8 @@
 {
-  "val_loss": 4.175543620305903,
-  "train_seconds": 83.3,
-  "steps": 610,
-  "tokens": 9994240,
-  "reached_target": true
+  "val_loss": 4.179678734611063,
+  "train_seconds": 15.35,
+  "steps": 975,
+  "tokens": 7987200,
+  "reached_target": true,
+  "trainer_log": "trainer.txt"
 }

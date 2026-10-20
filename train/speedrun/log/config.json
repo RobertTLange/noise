@@ -1,29 +1,16 @@
 {
-  "script": "/home/dev/pr/train/speedrun/run.py",
+  "script": "train/speedrun/run.py",
+  "trainer": "train/speedrun/jax/train.py",
   "world": 8,
-  "batch": 8,
-  "steps": 610,
+  "batch": 4,
+  "steps": 975,
   "seed": 0,
   "target": 4.2,
-  "recipe": {
-    "lr": 0.003,
-    "betas": [
-      0.7,
-      0.95
-    ],
-    "warmdown": 0.3,
-    "anvil_lr": 0.023,
-    "anvil_wd": 2.25
-  },
-  "settings": {
-    "sigma": 0.005,
-    "fc_k": 256,
-    "fc_sigma": 0.05,
-    "query_draws": 64,
-    "nrep": 64,
-    "chunk": 134217728,
-    "key_sigma": 0.003,
-    "key_chunk": 8
-  },
-  "torch_version": "2.10.0+cu128"
+  "overrides": [
+    "seed=0",
+    "num_iterations=975",
+    "data=logs/speedrun-147908/rows",
+    "save_steps=975",
+    "val_every=1000000"
+  ]
 }

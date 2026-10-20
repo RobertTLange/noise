@@ -1,0 +1,2812 @@
+"""Track 2's trainer: identity-path credit with ANVIL II and Adam on the benchmark's model, on 8 GPUs in one process,
+with no backward pass. The defaults are the record's recipe; train/speedrun/run.py launches it on the pinned data,
+exports the final weights and scores them with utils/eval.py.
+
+    python train.py data=<dir with train.npy, val.npy> [key=value ...]    # train (logs/<run_id>.txt, checkpoints)
+    python train.py export <checkpoint.npz> <out.npz>                     # utils/model.py's state dict
+
+Sections: the recipe; the model (forward only, with the clean pass's cache the estimator reads); the estimator
+(identity-path credit: one measured readout cycle at the top, one local step per site); the optimizers (Adam, and
+ANVIL II batched by matrix shape); training (the compiled step, warmup, timer, log); the export. The Pallas kernels
+are in kernels/.
+
+Every update is one XLA program under shard_map over a 'pop' axis of all GPUs (each runs the estimate for its share
+of the tokens; the collectives are inside), compiled ahead of time and run once on copies of the state before the
+timer starts. The timer covers the first update to the end of the last, excluding validation. The run log
+(logs/<run_id>.txt) opens with the source of this file and every kernel, so a record stays reproducible from its log.
+"""
+
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+import uuid
+from dataclasses import asdict, dataclass, fields
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
+from kernels import exact_keys, head_ce, probe_cycle, relu2_matmul, residual_norm, rope_norm
+
+SOURCES = (exact_keys, probe_cycle, head_ce, relu2_matmul, residual_norm, rope_norm)  # embedded in the run log
+F32, BF16 = jnp.float32, jnp.bfloat16
+EVAL_CHUNK_ROWS = 4  # validation rows per forward chunk: 544 val rows = 8 GPUs x 17 chunks
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Recipe
+# The record's recipe as defaults; key=value arguments override them.
+
+
+@dataclass
+class Hyperparameters:
+    # data
+    data: str = ""  # a directory with train.npy and val.npy: uint16 rows [N, T + 1] (run.py writes them)
+    train_rows: int = 4880  # train on the first rows only (the benchmark's train.pt); 0: all
+    max_epochs: int = 1  # passes over the train rows (each row feeds at most this many updates)
+    batch_size: int = 4  # rows per update
+    seq_len: int = 2048
+    seq_warmup: str = "1024:780"  # e.g. "512:200,1024:400": 512-token rows until step 200 (the same tokens per update)
+    # run
+    num_iterations: int = 975
+    val_every: int = 100
+    target: float = 4.2
+    save_every: int = 0  # latest checkpoint at logs/<run_id>.npz (0 disables)
+    save_steps: str = ""  # steps whose checkpoints are kept at logs/<run_id>-<step>.npz, e.g. "300,975"
+    seed: int = 0
+    rng: str = "rbg"  # rbg | unsafe_rbg | threefry2x32
+    # model
+    vocab_size: int = 4096
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
+    # optimizer: ANVIL II on the block matrices, Adam elsewhere, warmup-stable-decay
+    lr: float = 0.003
+    beta1: float = 0.7
+    beta2: float = 0.98
+    adam_eps: float = 1e-8
+    lr_wte: float = 0.9
+    lr_value_embeds: float = 0.9
+    lr_lambdas: float = 0.003
+    anvil_lr: float = 0.04
+    anvil_wd: float = 2.25  # ANVIL II's cautious weight decay (times its scheduled rate)
+    warmup_steps: int = 0
+    cooldown_steps: int = 390  # the last 40%
+
+
+def parse_args(argv):
+    hp = Hyperparameters()
+    types = {f.name: type(getattr(hp, f.name)) for f in fields(hp)}
+    for arg in argv:
+        name, value = arg.split("=", 1)
+        if name not in types:
+            raise SystemExit(f"unknown hyperparameter {name!r}")
+        setattr(hp, name, types[name](value))
+    if hp.batch_size * hp.seq_len % 128 or any(t * hp.n_head % 64 or hp.seq_len % t for t, _ in seq_stages(hp)):
+        raise SystemExit("kernels tile batch_size * seq_len by 128, row length * n_head by 64; lengths divide seq_len")
+    return hp
+
+
+def seq_stages(hp):
+    """[(row length, first step past it)] of the sequence-length warmup, ending with seq_len for the rest of the run."""
+    stages = [tuple(map(int, stage.split(":"))) for stage in hp.seq_warmup.split(",") if stage]
+    return [*stages, (hp.seq_len, math.inf)]
+
+
+def seq_length(step, hp):
+    return next(length for length, until in seq_stages(hp) if step < until)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Model
+# The benchmark's model (utils/model.py) in JAX: modded-nanoGPT as in the Dust paper (8L, d512, RoPE + QK-norm, relu²,
+# SSSL windows, value embeddings, x0 mixing, untied head, logit softcap). Linear weights are [in, out]; bf16 matmuls,
+# fp32 residual stream. The forward pass is forward-only (Pallas kernels without gradient rules); `clean_pass` caches
+# every block's inputs and outputs for the estimator (below).
+
+
+GATE_CHANNELS = 32
+SOFTCAP = 15.0
+HEAD_SLAB = 256
+
+
+@dataclass(frozen=True)
+class GPTConfig:
+    sequence_len: int = 2048
+    vocab_size: int = 4096
+    n_layer: int = 8
+    n_head: int = 8
+    n_embd: int = 512
+    window_pattern: str = "SSSL"
+
+    @property
+    def head_dim(self):
+        return self.n_embd // self.n_head
+
+    @property
+    def padded_vocab(self):
+        """Whole head slabs; padding columns are masked out of every softmax."""
+        return math.ceil(self.vocab_size / HEAD_SLAB) * HEAD_SLAB
+
+    def has_ve(self, layer):
+        return layer % 2 == (self.n_layer - 1) % 2
+
+    def window(self, layer):
+        """Keys visible to a query: positions s - window .. s."""
+        if layer == self.n_layer - 1:
+            return self.sequence_len
+        kind = self.window_pattern[layer % len(self.window_pattern)]
+        return self.sequence_len if kind == "L" else self.sequence_len // 2
+
+
+def norm(x):
+    x = x.astype(F32)
+    return x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + 1e-6)
+
+
+def linear(x, w):
+    return jnp.dot(x.astype(BF16), w.astype(BF16))
+
+
+def rotary(cfg, length):
+    dim = cfg.head_dim
+    inv_freq = 1.0 / 10000 ** (jnp.arange(0, dim, 2, dtype=F32) / dim)
+    freqs = jnp.outer(jnp.arange(length, dtype=F32), inv_freq)
+    return jnp.cos(freqs)[None, :, None, :], jnp.sin(freqs)[None, :, None, :]
+
+
+def process_qk(raw, cos, sin):
+    """RoPE then QK-norm, returned in bf16 (one fused pass; fp32 math)."""
+    return rope_norm.rope_norm(raw, cos, sin)
+
+
+def attention(q, k, v, window):
+    """Causal attention over [batch, token, head, dim]; query s sees keys s - window .. s."""
+    local = None if window >= q.shape[1] else (window, 0)
+    return jax.nn.dot_product_attention(
+        q.astype(BF16), k.astype(BF16), v.astype(BF16), is_causal=True, local_window_size=local, implementation="cudnn"
+    )
+
+
+def attention_with_lse(q, k, v, window):
+    """`attention` and its log-sum-exp [batch, head, token] (cuDNN's residual), for the exact-credit kernels."""
+    from jax._src.cudnn.fused_attention_stablehlo import MaskType, dot_product_attention
+
+    return dot_product_attention(q.astype(BF16), k.astype(BF16), v.astype(BF16), scale=q.shape[-1] ** -0.5,
+                                 mask_type=MaskType.CAUSAL, sliding_window_length=window + 1, return_residual=True)
+
+
+def init_params(cfg, key):
+    d, vp = cfg.n_embd, cfg.padded_vocab
+    s = math.sqrt(3.0) * d**-0.5
+    keys = iter(jax.random.split(key, 8 * cfg.n_layer + 8))
+    uniform = lambda shape, bound: jax.random.uniform(next(keys), shape, F32, -bound, bound)
+    proj = lambda fan_in, fan_out: uniform((fan_in, fan_out), 1.5 * math.sqrt(3.0 / fan_in))
+    blocks = []
+    for layer in range(cfg.n_layer):
+        block = {
+            "attn.c_q": uniform((d, d), s),
+            "attn.c_k": uniform((d, d), s),
+            "attn.c_v": uniform((d, d), s),
+            "attn.c_proj": proj(d, d),
+            "mlp.c_fc": uniform((d, 4 * d), s),
+            "mlp.c_proj": proj(4 * d, d),
+        }
+        if cfg.has_ve(layer):
+            block["attn.ve_gate"] = jnp.zeros((GATE_CHANNELS, cfg.n_head), F32)
+        blocks.append(block)
+    return {
+        "wte": jax.random.normal(next(keys), (vp, d), F32).astype(BF16),
+        "lm_head": 0.001 * jax.random.normal(next(keys), (d, vp), F32),
+        "blocks": blocks,
+        "value_embeds": {str(i): uniform((vp, d), s).astype(BF16) for i in range(cfg.n_layer) if cfg.has_ve(i)},
+        "resid_lambdas": jnp.ones((cfg.n_layer,), F32),
+        "x0_lambdas": jnp.full((cfg.n_layer,), 0.1, F32),
+    }
+
+
+def _rows(x):
+    return None if x is None else x.reshape(-1, x.shape[-1])
+
+
+def _residual(kernel, t, x, pending, *args):
+    """Run a residual_norm kernel on [B, T, D] operands; `pending` is a matmul output still to be added to x."""
+    stream, normed = kernel(_rows(x), _rows(pending), None, *args, sigma=0.0)
+    shape = (stream.shape[0] // t, t, stream.shape[-1])
+    return stream.reshape(shape), normed.reshape(shape)
+
+
+def attention_half(cfg, params, layer, x, pending, x0, idx, cache, rope):
+    """Residual add and mix, then attention: (mixed stream, attention output before attn.c_proj)."""
+    p = params["blocks"][layer]
+    b, t = idx.shape
+    h, hd = cfg.n_head, cfg.head_dim
+    lambdas = (_rows(x0), params["resid_lambdas"][layer], params["x0_lambdas"][layer])
+    mixed, n1 = _residual(residual_norm.add_mix_norm, t, x, pending, *lambdas)
+    q, k, v = (linear(n1, p[f"attn.c_{name}"]) for name in "qkv")
+    values = v.reshape(b, t, h, hd)
+    if cfg.has_ve(layer):
+        ve = params["value_embeds"][str(layer)][idx]
+        z = linear(n1[..., :GATE_CHANNELS], p["attn.ve_gate"])
+        values = values + (2 * jax.nn.sigmoid(z.astype(F32)))[..., None].astype(BF16) * ve.reshape(b, t, h, hd)
+    cos, sin = rope
+    qp = process_qk(q.reshape(b, t, h, hd), cos, sin)
+    kp = process_qk(k.reshape(b, t, h, hd), cos, sin)
+    pre = f"h{layer}."
+    if cache is None or jax.default_backend() != "gpu":  # cuDNN's residual: GPU only
+        o = attention(qp, kp, values, cfg.window(layer)).reshape(b, t, -1)
+    else:
+        o, lse = attention_with_lse(qp, kp, values, cfg.window(layer))
+        cache.update({pre + "attn.out": o, pre + "attn.lse": lse})  # the exact-credit kernels' clean attention
+        o = o.reshape(b, t, -1)
+    if cache is not None:
+        cache.update({pre + "in.attn": n1, pre + "attn.c_q": q, pre + "attn.c_k": k, pre + "attn.c_v": v})
+        if cfg.has_ve(layer):
+            cache[pre + "attn.ve_gate"] = z
+            cache[f"ve{layer}"] = ve
+    return mixed, o
+
+
+def projection_and_mlp(params, layer, mixed, o, cache):
+    """attn.c_proj and its residual add, then the MLP: (stream, MLP output still to be added to it)."""
+    w = params["blocks"][layer]
+    x, n2 = _residual(residual_norm.add_norm, o.shape[1], mixed, linear(o, w["attn.c_proj"]))
+    if cache is None:  # c_fc's output is not needed: fused matmul + relu²
+        act = relu2_matmul.relu2_matmul(n2.reshape(-1, n2.shape[-1]), w["mlp.c_fc"]).reshape(*n2.shape[:-1], -1)
+    else:
+        hidden = linear(n2, w["mlp.c_fc"])
+        act = jnp.square(jax.nn.relu(hidden))
+        cache.update({f"h{layer}.in.attn.c_proj": o, f"h{layer}.in.mlp.c_fc": n2, f"h{layer}.mlp.c_fc": hidden,
+                      f"h{layer}.in.mlp.c_proj": act})
+    return x, linear(act, w["mlp.c_proj"])
+
+
+def softcap(x):
+    return SOFTCAP * jnp.tanh(x / SOFTCAP)
+
+
+def mask_padding(logits, vocab_size):
+    return jnp.where(jnp.arange(logits.shape[-1]) < vocab_size, logits, -jnp.inf)
+
+
+def head_losses(cfg, final, lm_head, targets):
+    """Per-token losses [rows, T]: fused LM head + softcap + cross-entropy (fp32 logits, never materialized)."""
+    rows, t, d = final.shape
+    return head_ce.head_ce(final.reshape(-1, d), lm_head, targets.reshape(-1), cfg.vocab_size).reshape(rows, t)
+
+
+def forward(cfg, params, idx, targets, cache=None):
+    """Per-token losses [B, T] (fp32); fills `cache` (if given) with what the estimator reads."""
+    rope = rotary(cfg, idx.shape[1])
+    x = norm(params["wte"][idx])
+    x0, pending = x, None
+    if cache is not None:
+        cache["x0"] = x0
+    for layer in range(cfg.n_layer):
+        mixed, o = attention_half(cfg, params, layer, x, pending, x0, idx, cache, rope)
+        x, pending = projection_and_mlp(params, layer, mixed, o, cache)
+        if cache is not None:  # the stream after the block
+            cache[f"h{layer}.out"] = x.astype(F32) + pending.astype(F32)
+    _, final = _residual(residual_norm.add_norm, idx.shape[1], x, pending)
+    if cache is not None:  # the head's credit moves these logits directly
+        cache["in.lm_head"], cache["lm_head"] = final, linear(final, params["lm_head"])
+    return head_losses(cfg, final, params["lm_head"], targets)
+
+
+@dataclass
+class Clean:
+    """The clean forward pass the estimator's experiments are measured against."""
+
+    cfg: GPTConfig
+    params: dict
+    idx: jax.Array
+    targets: jax.Array
+    cache: dict
+    loss: jax.Array  # per-token clean loss [B, T]
+
+
+def clean_pass(cfg, params, idx, targets):
+    cache = {}
+    loss = forward(cfg, params, idx, targets, cache=cache)
+    return Clean(cfg, params, idx, targets, cache, loss)
+
+
+def site_layer(site):
+    return int(site.split(".")[0][1:])
+
+
+def site_input(clean, site):
+    """The cached input [B, T, in] of a weight site (not the embeddings)."""
+    layer, name = site_layer(site), site.split(".", 1)[1]
+    if name in ("attn.c_q", "attn.c_k", "attn.c_v"):
+        return clean.cache[f"h{layer}.in.attn"]
+    if name == "attn.ve_gate":
+        return clean.cache[f"h{layer}.in.attn"][..., :GATE_CHANNELS]
+    return clean.cache[f"h{layer}.in.{name}"]
+
+
+def set_grad(grads, site, value):
+    if site == "wte":
+        grads[site] = value
+    elif site.startswith("ve"):
+        grads["value_embeds"][site[2:]] = value
+    else:
+        grads["blocks"][site_layer(site)][site.split(".", 1)[1]] = value
+
+
+def coordinate_change(raw, targets, vocab, sigma):
+    """The LM head's credit on raw logits (..., padded vocab): for every token and logit j, the token's loss with raw
+    logit j moved up by sigma minus moved down, over 2 sigma. Moving one logit changes the partition by one term, so
+    each moved loss is the clean loss plus log1p(p_j expm1(z_j' - z_j)), minus the target logit's own move."""
+    raw = raw.astype(F32)
+    z = mask_padding(softcap(raw), vocab)
+    up, down = softcap(raw + sigma), softcap(raw - sigma)
+    weight = jax.nn.softmax(z, axis=-1)  # the clean forward's probabilities (0 at the padding)
+    moved = lambda new: jnp.log1p(weight * jnp.expm1(new - jnp.where(weight > 0, z, new)))
+    change = moved(up) - moved(down)
+    at_target = jax.nn.one_hot(targets, raw.shape[-1], dtype=F32)
+    change = change - at_target * (up - down)
+    return change / (2 * sigma)
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Estimator
+# Identity-path credit (record #7, Noise PR #16), each GPU running it for 1 / shards of the tokens.
+#
+# One readout cycle per update measures each token's credit at the top stream: the stream moves along every row of a
+# sign-flipped order-512 Hadamard matrix and the readout (norm, head, softcap, cross-entropy) is evaluated on each move.
+# Every block's output stream gets that credit through the residual path alone (scaled by the residual scalars above
+# it), the embedding through the same path plus the x0 injections. Everything else is one local step from those
+# credits: the writers' gradients directly, the MLP hidden credit by one relu² slope per unit, the attention-output
+# targets as `credit @ W_projᵀ` (a linear map of measured credit doesn't count as a step), and from them the queries,
+# keys and values by single-coordinate experiments evaluated exactly (kernels/exact_keys.py), the gates by one sigmoid
+# slope. No credit is read back through a block's weights into the block below.
+
+
+EPS = float(np.finfo(np.float32).eps)  # the readout norm's epsilon (torch's rms_norm default)
+SIGMA = 0.005  # the top cycle's step, relative to the stream's RMS at that token
+FC_SIGMA = 0.05  # the MLP units' central-difference step, relative to the pre-activation RMS
+KEY_SIGMA = 0.003  # the query / key coordinate step, relative to the raw query's (key's) RMS at that token
+HEAD_SIGMA = 0.1  # the head's logit step
+GATE_STEP = 0.1  # the gates' central-difference step on the gate logit
+TOKEN_CHUNK = 1024  # tokens per readout-cycle chunk
+PROBE_TILES = {"block_rows": 64, "block_dirs": 8, "block_vocab": 128, "num_warps": 8, "num_stages": 1}
+
+
+def hadamard(d):
+    """The Sylvester Hadamard matrix of order d (a power of two), entries +-1."""
+    h = np.ones((1, 1), np.float32)
+    while h.shape[0] < d:
+        h = np.block([[h, h], [h, -h]])
+    return jnp.asarray(h)
+
+
+def flipped(key, d):
+    """A full cycle of d orthogonal directions: the order-d Hadamard matrix with randomly flipped columns."""
+    return hadamard(d) * jax.random.rademacher(key, (d,), F32)
+
+
+def my_rows(matrix, shards, axis=0):
+    """This GPU's 1 / shards of `matrix` along `axis`."""
+    per = matrix.shape[axis] // shards
+    return jax.lax.dynamic_slice_in_dim(matrix, jax.lax.axis_index("pop") * per, per, axis)
+
+
+def cycle_derivatives(base, c, y, steps, sq, dots, dir_sq, width):
+    """Forward differences of each token's readout loss along every direction j of a cycle: (moved - clean) / step.
+    base (n, V) the clean raw logits; c (P, V) row j the logits of direction j; steps (n, 1); sq (n, 1) |x|^2;
+    dots (n, P) x . D_j; dir_sq (P,) |D_j|^2. The moved stream's RMS comes from these, so the head's norm is exact.
+    The partition functions come from kernels/probe_cycle.py (no [n, P, V] logits); the clean one runs through the
+    kernel too (as zero directions), so its approximation errors cancel in the differences."""
+    inv = jax.lax.rsqrt((sq + 2 * steps * dots + steps * steps * dir_sq) / width + EPS)
+    inv0 = jax.lax.rsqrt(sq / width + EPS)
+    clean_dirs = PROBE_TILES["block_dirs"]
+    totals = probe_cycle.partitions(base, jnp.pad(c, ((0, clean_dirs), (0, 0))), steps,
+                                    jnp.concatenate([inv, jnp.tile(inv0, (1, clean_dirs))], 1), **PROBE_TILES)
+    partitions = jnp.log(totals)
+    base_y = jnp.take_along_axis(base, y[:, None], axis=1)
+    dirs_y = c.T[y]  # (n, P)
+    clean = partitions[:, -1:] - softcap(base_y * inv0)
+    moved = partitions[:, :-clean_dirs] - softcap((base_y + steps * dirs_y) * inv)
+    return (moved - clean) / steps
+
+
+def top_credit(params, key, x, y, vocab):
+    """Each token's readout credit (m, d) at the top stream x (m, d), from the whole cycle of directions."""
+    width = x.shape[-1]
+    head = params["lm_head"][:, :vocab].astype(F32)
+    h = flipped(key, width)  # (P, d): row j is h_j
+    c, dir_sq = h @ head, jnp.sum(h * h, axis=1)
+    steps = SIGMA * jnp.maximum(jnp.sqrt(jnp.mean(x * x, -1, keepdims=True)), 1e-6)
+
+    def chunk(args):
+        xs, ys, st = args
+        derivative = cycle_derivatives(xs @ head, c, ys, st, jnp.sum(xs * xs, -1, keepdims=True), xs @ h.T, dir_sq,
+                                       width)
+        return derivative @ h / width
+
+    m = x.shape[0]
+    size = min(TOKEN_CHUNK, m)
+    split = lambda a: a.reshape(m // size, size, *a.shape[1:])
+    return jax.lax.map(chunk, (split(x), split(y), split(steps))).reshape(m, width)
+
+
+def hidden_credit(u, credit, w_out):
+    """MLP hidden credit (m, hidden) for every unit: each unit's central difference through relu² (a step of FC_SIGMA
+    times the pre-activation RMS), read against the block-output credit through its output row (`credit @ W_outᵀ`,
+    a linear map of measured credit)."""
+    step = FC_SIGMA * jnp.maximum(jnp.sqrt(jnp.mean(u * u, -1, keepdims=True)), 1e-6)
+    relu2 = lambda x: jnp.square(jax.nn.relu(x))
+    slope = (relu2(u + step) - relu2(u - step)) / (2 * step)
+    read = jnp.dot(credit.astype(BF16), w_out.astype(BF16).T, preferred_element_type=F32)
+    return slope * read
+
+
+def rope32(x, cos, sin):
+    """RoPE then QK-norm in float32 (process_qk without its bf16 output)."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    rotated = jnp.concatenate([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], axis=-1)
+    return rotated * jax.lax.rsqrt(jnp.mean(rotated * rotated, axis=-1, keepdims=True) + 1e-6)
+
+
+def exact_blocks(q_raw, k_raw, values, hub, window, rope, shards, clean_attention=None):
+    """Query and key credit by single-coordinate experiments, each evaluated exactly: the raw key (query) at position
+    t moves by step_t e_j and nothing else moves. A key move changes each query's output in one term,
+    o'_s - o_s = (a' - a)(v_t - o_s) / (1 - a + a'), a' = a exp(dl); a query move reweights its own output's keys. Each
+    change is scored against the query's attention-output credit (hub_s . (o'_s - o_s)): one local step. The sums run
+    in kernels/exact_keys.py from cuDNN's clean log-sum-exp and output; each GPU takes 1 / shards of the dimensions j.
+    Returns (the values' exact credit sum_s A[s, t] hub_s (b, t, h, d), whole; {q, k: this GPU's block of dims
+    (b, h, t, d / shards)}). `clean_attention`: the clean pass's (output, log-sum-exp), else recomputed."""
+    b, t, h, hd = k_raw.shape
+    cos, sin = rope
+    qp, kp = rope32(q_raw, cos, sin), rope32(k_raw, cos, sin)
+    out, lse = clean_attention or attention_with_lse(qp, kp, values, window)  # out [b, t, h, d], lse [b, h, t]
+    hub_out = jnp.swapaxes(jnp.sum(hub * out.astype(F32), -1), 1, 2).reshape(b * h, t)
+    lse = lse.astype(F32).reshape(b * h, t)
+    per = hd // shards
+    dims = jax.lax.axis_index("pop") * per + jnp.arange(per)  # this GPU's block of dims j
+    rows = lambda x: jnp.swapaxes(x, 1, 2).reshape(b * h, t, hd)  # [b, t, h, d] -> [b h, t, d]
+    clean = rows(qp), rows(kp), rows(values), rows(hub)
+    rotation = cos.reshape(t, hd // 2), sin.reshape(t, hd // 2)
+    chunk = min(per, 8)  # directions per kernel call
+
+    def credit(raw, other, kernel, coef_axes, cols_axes):
+        """This GPU's block [b, h, t, per] of a kind's credit: `other` the other side's processed rows, *_axes the
+        (direction, position) axes each kernel input takes for the coefficients [b h, 3, ., .] and columns."""
+        coef, steps = exact_keys.closed_coefficients(rows(raw), *rotation, dims, KEY_SIGMA)  # [b h, 3, t, per]
+        coef = jnp.moveaxis(coef, (3, 2), coef_axes)
+        cols = jnp.moveaxis(exact_keys.rotated_columns(other, dims), (3, 2), cols_axes)  # from [b h, 2, t, per]
+        part = lambda x, axis, j: jax.lax.slice_in_dim(x, j, j + chunk, axis=axis)
+        score = jnp.concatenate([kernel(*clean, part(coef, coef_axes[0], j), part(cols, cols_axes[0], j), lse,
+                                        hub_out, window) for j in range(0, per, chunk)], -1)
+        return score.reshape(b, h, t, per) / steps.reshape(b, h, t, 1)
+
+    value_credit = jnp.swapaxes(exact_keys.value_credit(clean[0], clean[1], clean[3], lse, window).reshape(
+        b, h, t, hd), 1, 2)  # [b, t, h, d]
+    blocks = {
+        "q": credit(q_raw, clean[1], exact_keys.closed_query_scores, (3, 2), (2, 3)),  # key columns [., J, T]
+        "k": credit(k_raw, clean[0], exact_keys.closed_scores, (2, 3), (3, 2)),  # key coefficients [., J, T]
+    }
+    return value_credit, blocks
+
+
+def attention_credit(clean, put, i, hub, rope, mine, shards):
+    """Layer i's queries, keys, values, gates and value embeddings, one local step from its attention-output targets
+    `hub` (n, d), whole: this GPU's tokens' errors go to `put`."""
+    cfg, cache, pre = clean.cfg, clean.cache, f"h{i}."
+    b, t = clean.idx.shape
+    h, hd = cfg.n_head, cfg.head_dim
+    q_raw, k_raw, v_raw = (cache[pre + f"attn.c_{s}"].astype(F32).reshape(b, t, h, hd) for s in "qkv")
+    values, z, ve = v_raw, None, None
+    if cfg.has_ve(i):
+        z, ve = cache[pre + "attn.ve_gate"].astype(F32), cache[f"ve{i}"].astype(F32).reshape(b, t, h, hd)
+        values = values + 2 * jax.nn.sigmoid(z)[..., None] * ve
+    clean_attention = (cache[pre + "attn.out"], cache[pre + "attn.lse"]) if pre + "attn.lse" in cache else None
+    value_credit, blocks = exact_blocks(q_raw, k_raw, values, hub.reshape(b, t, h, hd), cfg.window(i), rope, shards,
+                                        clean_attention)
+    stacked = jnp.swapaxes(jnp.stack([blocks["q"], blocks["k"]]), 2, 3).reshape(2, b * t, h, -1)  # [2, n, h, hd / s]
+    by_token = jax.lax.all_to_all(stacked, "pop", 1, 3, tiled=True).reshape(2, -1, h * hd)  # [2, m, d]
+    errors = {"q": by_token[0], "k": by_token[1], "v": mine(value_credit)}
+    for kind in "qkv":
+        put(pre + f"attn.c_{kind}", errors[kind])
+    if cfg.has_ve(i):
+        z, ve = mine(z), mine(ve).reshape(-1, h, hd)
+        credit = errors["v"].reshape(-1, h, hd)
+        slope = (jax.nn.sigmoid(z + GATE_STEP) - jax.nn.sigmoid(z - GATE_STEP)) / GATE_STEP
+        put(pre + "attn.ve_gate", slope * jnp.sum(credit * ve, -1))
+        put(f"ve{i}", (credit * 2 * jax.nn.sigmoid(z)[..., None]).reshape(-1, h * hd))
+
+
+def identity_grad(cfg, params, idx, targets, key, shards):
+    """(The identity-path gradient estimate, the mean clean token loss), inside shard_map over the 'pop' axis: the top
+    cycle (all directions) on this GPU's tokens, the MLP steps on them, and its share of every weight gradient. Per
+    block, the attention-output credit is gathered for the exact query, key and value kernels (which split the head
+    dimensions) and their query and key credits come back by token (an all-to-all); the gradients are summed over the
+    GPUs once."""
+    clean = clean_pass(cfg, params, idx, targets)
+    cache, (b, t), vocab = clean.cache, idx.shape, cfg.vocab_size
+    n, layers = b * t, cfg.n_layer
+    rope = rotary(cfg, t)
+    mine = lambda a: my_rows(a.reshape(n, -1), shards)  # this GPU's tokens
+    stream = lambda name: mine(cache[name].astype(F32))
+    y, tokens = mine(targets)[:, 0], mine(idx)[:, 0]
+    grads = jax.tree.map(lambda p: jnp.zeros(p.shape, F32), params)
+
+    def put(site, error):
+        if site == "wte" or site.startswith("ve"):
+            value = jnp.zeros((cfg.padded_vocab, error.shape[-1]), F32).at[tokens].add(error)
+        else:
+            value = mine(site_input(clean, site)).astype(F32).T @ error
+        set_grad(grads, site, value)
+
+    coordinates = coordinate_change(mine(cache["lm_head"]), y, vocab, HEAD_SIGMA)
+    grads["lm_head"] = mine(cache["in.lm_head"]).astype(F32).T @ coordinates
+    credit_out = top_credit(params, jax.random.split(key)[0], stream(f"h{layers - 1}.out"), y, vocab)
+    lam_r, lam_0 = params["resid_lambdas"].astype(F32), params["x0_lambdas"].astype(F32)
+    x0 = stream("x0")
+    credit_x0 = jnp.zeros_like(x0)
+    scalars = jnp.zeros((2, layers), F32)
+    for i in reversed(range(layers)):  # credit_out: the credit of block i's output stream
+        w, pre = params["blocks"][i], f"h{i}."
+        put(pre + "mlp.c_proj", credit_out)
+        put(pre + "mlp.c_fc", hidden_credit(stream(pre + "mlp.c_fc"), credit_out, w["mlp.c_proj"]))
+        put(pre + "attn.c_proj", credit_out)
+        hub = jax.lax.all_gather((credit_out @ w["attn.c_proj"].astype(F32).T).astype(BF16), "pop", axis=0,
+                                 tiled=True).astype(F32)  # bf16: the exact kernels read it in bf16
+        attention_credit(clean, put, i, hub, rope, mine, shards)
+        prev = x0 if i == 0 else stream(f"h{i - 1}.out")
+        scalars = scalars.at[:, i].set(jnp.stack([jnp.sum(credit_out * prev), jnp.sum(credit_out * x0)]))
+        credit_x0 = credit_x0 + lam_0[i] * credit_out
+        credit_out = lam_r[i] * credit_out  # down the residual path to block i - 1's output
+    credit_x0 = credit_x0 + credit_out  # block 0 reads x0 as its previous stream too
+    put("wte", credit_x0)
+    grads["resid_lambdas"], grads["x0_lambdas"] = scalars[0], scalars[1]
+    grads = jax.tree.map(lambda g, p: (jax.lax.psum(g, "pop") / n).astype(p.dtype), grads, params)
+    return grads, clean.loss.mean()
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Optimizers
+# The optimizers, as record #7's: ANVIL II (modded-nanogpt PR #360, the Noise benchmark's) on the block matrices and
+# torch.optim.Adam (no weight decay) on the rest, with per-group learning rates times a warmup-stable-decay schedule.
+# ANVIL II runs as one batched update per matrix shape, each GPU stepping its share of the matrices.
+
+
+ANVIL_KINDS = ("attn.c_q", "attn.c_k", "attn.c_v", "attn.c_proj", "mlp.c_fc", "mlp.c_proj")  # not the gate
+ANVIL_MAPS = (  # six quintic maps toward the polar factor
+    (3.923798038567, -6.095026865488, 3.905234618423),
+    (3.278126713798, -3.328923386476, 0.989127286973),
+    (3.505298394150, -5.137358782410, 1.968325560615),
+    (2.815058591845, -3.685181239622, 1.417196497642),
+    (2.245503932403, -2.443826979899, 0.963091710461),
+    (2.256537145403, -2.166840097229, 0.929501253245),
+)
+POLAR_MARGIN = 1.1  # the gradient's Frobenius norm times this bounds its spectral norm before the maps (PR #16's)
+ANVIL_RUN = (1194, 240, 50, 514)  # PR #360's total, warmup, cooldown and engage steps; scaled to the run length
+
+
+def lr_scale(step, hp):
+    """Warmup-stable-decay: linear from 1/warmup_steps to 1 over the first warmup_steps, then 1, then linear to 0 over
+    the last cooldown_steps before num_iterations."""
+    warmup = min(1.0, (step + 1) / hp.warmup_steps) if hp.warmup_steps else 1.0
+    remaining = hp.num_iterations - step
+    return warmup * (1.0 if remaining >= hp.cooldown_steps else remaining / hp.cooldown_steps)
+
+
+def learning_rates(params, hp):
+    def rate(path, _):
+        group = str(getattr(path[0], "key", path[0]))
+        if group == "wte":
+            return hp.lr_wte
+        if group == "value_embeds":
+            return hp.lr_value_embeds
+        return hp.lr_lambdas if group.endswith("lambdas") else hp.lr
+
+    return jax.tree_util.tree_map_with_path(rate, params)
+
+
+def init_optimizer(params):
+    """Adam's fp32 first and second moments, and ANVIL II's state per block matrix."""
+    zeros = lambda: jax.tree.map(lambda p: jnp.zeros(p.shape, F32), params)
+    anvil = [{kind: anvil_state(w) for kind, w in block.items() if kind in ANVIL_KINDS} for block in params["blocks"]]
+    return {"m": zeros(), "v": zeros(), "anvil": anvil}
+
+
+def adam_update(params, grads, moments, rates, step_index, hp):
+    """torch.optim.Adam without weight decay: bias-corrected moments, step_index counting from 0."""
+    t = step_index.astype(F32) + 1
+    correction1, correction2 = 1 - hp.beta1**t, 1 - hp.beta2**t
+    m = jax.tree.map(lambda m, g: hp.beta1 * m + (1 - hp.beta1) * g.astype(F32), moments["m"], grads)
+    v = jax.tree.map(lambda v, g: hp.beta2 * v + (1 - hp.beta2) * jnp.square(g.astype(F32)), moments["v"], grads)
+    direction = lambda m, v: m / correction1 / (jnp.sqrt(v) / jnp.sqrt(correction2) + hp.adam_eps)
+    directions = jax.tree.map(direction, m, v)
+    params = jax.tree.map(lambda p, d, lr: (p.astype(F32) - lr * d).astype(p.dtype), params, directions, rates)
+    return params, {"m": m, "v": v}
+
+
+def anvil_lane_axis(w):
+    """The axis ANVIL II averages its per-lane energy over: weights here are (in, out), torch's (out, in)."""
+    return 0 if w.shape[1] >= w.shape[0] else 1
+
+
+def anvil_state(w):
+    zeros = jnp.zeros(w.shape, F32)
+    return {"fast": zeros, "slow": zeros, "energy": jnp.zeros_like(zeros.mean(anvil_lane_axis(w), keepdims=True))}
+
+
+def polar(g):
+    """Approximate orthogonalization (the polar factor) with ANVIL_MAPS, in bf16 on the wide orientation."""
+    tall = g.shape[0] > g.shape[1]
+    x = g.T if tall else g
+    x = (x / (POLAR_MARGIN * jnp.linalg.norm(x) + 1e-6)).astype(BF16)
+    for a, b, c in ANVIL_MAPS:
+        sq = x @ x.T
+        x = a * x + (b * sq + c * (sq @ sq)) @ x
+    return (x.T if tall else x).astype(F32)
+
+
+def anvil_betas(step_index, steps):
+    """(rail beta, fast beta, fast weight) at a step: the rail beta warms from 0.85 to 0.93 and cools back over the
+    scaled cooldown; after the scaled engage step the fast rail runs at 0.85 and mixes 0.4385 with the slow rail."""
+    total, warmup, cooldown, engage = (round(k * steps / ANVIL_RUN[0]) for k in ANVIL_RUN)
+    t, lo, hi = step_index.astype(F32), 0.85, 0.93
+    beta = jnp.where(t < warmup, lo + (hi - lo) * t / max(warmup, 1), hi)
+    beta = jnp.where(t > total - cooldown, hi - (hi - lo) * (t - (total - cooldown)) / max(cooldown, 1), beta)
+    engaged = t >= engage
+    return beta, jnp.where(engaged, 0.85, beta), jnp.where(engaged, 0.4385, 1.0)
+
+
+def anvil_rate(shape):
+    """ANVIL II's rate factor sqrt(max(1, out / in)) of an (in, out) weight."""
+    return max(1.0, shape[1] / shape[0]) ** 0.5
+
+
+def anvil_step(w, g, state, lr, betas, wd, rate):
+    """ANVIL II on one matrix: a fast and a slow gradient average, the polar factor of the gradient pulled toward
+    their mix, per-lane energy normalization at the same norm, cautious weight decay, and the rate factor (a matrix
+    and its transpose step alike, so the wide and the tall kinds of one shape batch together)."""
+    beta, fast_beta, weight = betas
+    g = g.astype(F32)
+    fast = state["fast"] + (1 - fast_beta) * (g - state["fast"])
+    slow = state["slow"] + (1 - 0.98) * (g - state["slow"])
+    update = polar(g + beta * (weight * fast + (1 - weight) * slow - g))
+    energy = state["energy"] + (1 - 0.9) * (jnp.square(update).mean(anvil_lane_axis(w), keepdims=True) - state["energy"])
+    gained = update * jax.lax.rsqrt(jnp.maximum(energy, 1e-10))
+    update = gained * (jnp.linalg.norm(update) / jnp.maximum(jnp.linalg.norm(gained), 1e-10))
+    w32 = w.astype(F32)
+    decay = ((slow * w32) >= 0) * w32 * (wd * lr)
+    w32 = w32 - lr * rate * (update + decay)
+    return w32.astype(w.dtype), {"fast": fast, "slow": slow, "energy": energy}
+
+
+def stack_kind(trees, kind):
+    """The blocks' trees of one weight kind stacked along a leading layer axis."""
+    return jax.tree.map(lambda *xs: jnp.stack(xs), *[tree[kind] for tree in trees])
+
+
+def anvil_groups(block):
+    """The ANVIL kinds of a block grouped by their wide shape: [(kinds, tall flags)] (tall kinds step transposed)."""
+    groups = {}
+    for kind, w in block.items():
+        groups.setdefault(tuple(sorted(w.shape)), []).append((kind, w.shape[0] > w.shape[1]))
+    return [tuple(zip(*members, strict=True)) for members in groups.values()]
+
+
+def orient(x, tall):
+    return jnp.swapaxes(x, -1, -2) if tall else x
+
+
+def group_stack(trees, kinds, talls):
+    """The blocks' matrices (or state trees) of a group's kinds, wide side out, along one leading axis."""
+    stacks = [jax.tree.map(lambda x, tall=tall: orient(x, tall), stack_kind(trees, kind))
+              for kind, tall in zip(kinds, talls, strict=True)]
+    return jax.tree.map(lambda *xs: jnp.concatenate(xs), *stacks)
+
+
+def group_unstack(stack, kinds, talls, layers):
+    """{kind: per-block list} back from a group stack."""
+    return {kind: [jax.tree.map(lambda x, j=j * layers + i, tall=tall: orient(x[j], tall), stack) for i in range(layers)]
+            for j, (kind, tall) in enumerate(zip(kinds, talls, strict=True))}
+
+
+def owned_slice(count, shards):
+    """(first, size) of this GPU's matrices in a group of `count`: count / shards when they divide, else all."""
+    if shards == 1 or count % shards:
+        return 0, count
+    per = count // shards
+    return jax.lax.axis_index("pop") * per, per
+
+
+def anvil_blocks(blocks, grads, states, lr, step_index, hp, shards):
+    """The block matrices' ANVIL II steps (from the weights before this step) and the new states: one batched update
+    per wide shape. Each GPU steps its share of a group (the gradients are the same on every GPU), the new weights
+    are gathered, and each GPU keeps only its share's states current (`gather_anvil_states` collects them)."""
+    betas = anvil_betas(step_index, hp.num_iterations)
+    layers = len(blocks)
+    stepped, new_states = [{} for _ in blocks], [{} for _ in blocks]
+    for kinds, talls in anvil_groups({kind: blocks[0][kind] for kind in states[0]}):
+        rates = jnp.repeat(jnp.asarray([anvil_rate(blocks[0][k].shape) for k in kinds], F32), layers)
+        first, per = owned_slice(len(kinds) * layers, shards)
+        mine = lambda x, first=first, per=per: jax.lax.dynamic_slice_in_dim(x, first, per, 0)
+        old = group_stack(states, kinds, talls)
+        update = jax.vmap(lambda w, g, st, rate: anvil_step(w, g, st, lr, betas, hp.anvil_wd, rate))
+        w, st = update(mine(group_stack(blocks, kinds, talls)), mine(group_stack(grads, kinds, talls)),
+                       jax.tree.map(mine, old), mine(rates))
+        if per < len(kinds) * layers:
+            w = jax.lax.all_gather(w, "pop", axis=0, tiled=True)
+            st = jax.tree.map(lambda full, part, first=first: jax.lax.dynamic_update_slice_in_dim(full, part, first, 0),
+                              old, st)
+        for kind, ws in group_unstack(w, kinds, talls, layers).items():
+            for i, x in enumerate(ws):
+                stepped[i][kind] = x
+        for kind, sts in group_unstack(st, kinds, talls, layers).items():
+            for i, x in enumerate(sts):
+                new_states[i][kind] = x
+    return stepped, new_states
+
+
+def gather_anvil_states(states, shards):
+    """Every matrix's ANVIL state from the GPU that steps it (inside shard_map; for checkpoints)."""
+    layers = len(states)
+    gathered = [{} for _ in states]
+    for kinds, talls in anvil_groups({k: v["fast"] for k, v in states[0].items()}):
+        first, per = owned_slice(len(kinds) * layers, shards)
+        stack = group_stack(states, kinds, talls)
+        if per < len(kinds) * layers:
+            mine = lambda x, first=first, per=per: jax.lax.dynamic_slice_in_dim(x, first, per, 0)
+            stack = jax.tree.map(lambda x, mine=mine: jax.lax.all_gather(mine(x), "pop", axis=0, tiled=True), stack)
+        for kind, sts in group_unstack(stack, kinds, talls, layers).items():
+            for i, x in enumerate(sts):
+                gathered[i][kind] = x
+    return gathered
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Training
+# Data, the compiled step, validation, checkpoints and the timed loop.
+
+
+def train_batches(rows, batch_size, seed, max_epochs):
+    """[B, T] int32 (inputs, targets) over shuffled epochs (epoch e permutes rows with rng (seed, e))."""
+    for epoch in range(max_epochs):
+        order = np.random.default_rng((seed, epoch)).permutation(len(rows))
+        for index in range(0, len(rows) - batch_size + 1, batch_size):
+            batch = np.asarray(rows[np.sort(order[index : index + batch_size])], np.int32)
+            yield batch[:, :-1], batch[:, 1:]
+
+
+def make_train_step(cfg, hp, mesh):
+    shards = mesh.size
+
+    def step(params, buffers, idx, targets, step_index, scale):
+        key = jax.random.fold_in(jax.random.key(hp.seed), step_index)
+        grads, loss = identity_grad(cfg, params, idx, targets, key, shards)
+        rates = jax.tree.map(lambda lr: scale * lr, learning_rates(params, hp))
+        stepped, anvil = anvil_blocks(params["blocks"], grads["blocks"], buffers["anvil"], scale * hp.anvil_lr,
+                                            step_index, hp, shards)
+        params, state = adam_update(params, grads, buffers, rates, step_index, hp)
+        params["blocks"] = [b | s for b, s in zip(params["blocks"], stepped, strict=True)]  # ANVIL's block matrices
+        return params, state | {"anvil": anvil}, loss
+
+    sharded = jax.shard_map(step, mesh=mesh, in_specs=(P(),) * 6, out_specs=(P(),) * 3, check_vma=False)
+    return jax.jit(sharded, donate_argnums=(0, 1))
+
+
+def make_evaluate(cfg, mesh):
+    """Summed token loss over validation rows [N, T+1], rows split over the 'pop' axis."""
+
+    def evaluate(params, rows):
+        def chunk_loss(chunk):
+            return forward(cfg, params, chunk[:, :-1].astype(jnp.int32), chunk[:, 1:].astype(jnp.int32)).sum()
+
+        total = jax.lax.map(chunk_loss, rows.reshape(-1, EVAL_CHUNK_ROWS, rows.shape[-1])).sum()
+        return jax.lax.psum(total, "pop")
+
+    sharded = jax.shard_map(evaluate, mesh=mesh, in_specs=(P(), P("pop")), out_specs=P(), check_vma=False)
+    return jax.jit(sharded)
+
+
+def save_checkpoint(path, params, buffers, meta):
+    """Parameters p0, p1, ... and optimizer state m0, m1, ... in tree-leaf order (fp32), with `meta` as json."""
+    arrays = {f"p{i}": np.asarray(x, np.float32) for i, x in enumerate(jax.tree.leaves(params))}
+    arrays |= {f"m{i}": np.asarray(x, np.float32) for i, x in enumerate(jax.tree.leaves(buffers))}
+    tmp = path.with_suffix(".tmp.npz")
+    np.savez(tmp, meta=json.dumps(meta), **arrays)
+    tmp.replace(path)
+
+
+def load_rows(hp, mesh):
+    data = Path(hp.data)
+    if not (data / "train.npy").exists():
+        raise SystemExit(f"no train.npy in {str(data)!r}: pass data=<dir> (train/speedrun/run.py writes it)")
+    train_rows = np.load(data / "train.npy", mmap_mode="r")
+    if hp.train_rows > len(train_rows) or hp.train_rows < 0:
+        raise SystemExit(f"train_rows={hp.train_rows}: the train split has {len(train_rows)} rows")
+    train_rows = train_rows[: hp.train_rows or len(train_rows)]
+    val_rows = np.load(data / "val.npy")
+    if train_rows.shape[1] != hp.seq_len + 1 or val_rows.shape[1] != hp.seq_len + 1:
+        raise SystemExit(f"train/val rows of {train_rows.shape[1]}/{val_rows.shape[1]} tokens must be seq_len + 1")
+    if len(val_rows) % (mesh.size * EVAL_CHUNK_ROWS):
+        raise SystemExit(f"val rows ({len(val_rows)}) must divide by {mesh.size * EVAL_CHUNK_ROWS}")
+    return train_rows, val_rows
+
+
+def main():
+    os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")  # read when the backend starts
+    jax.config.update("jax_use_shardy_partitioner", False)  # Shardy's unused-inputs pass segfaults on this step
+    hp = parse_args(sys.argv[1:])
+    jax.config.update("jax_default_prng_impl", hp.rng)  # before any key exists
+    run_id = str(uuid.uuid4())
+    root = Path(__file__).parent
+    logs = root / "logs"
+    logs.mkdir(exist_ok=True)
+    logfile = logs / f"{run_id}.txt"
+
+    def print0(text="", console=True):
+        if console:
+            print(text, flush=True)
+        with open(logfile, "a") as f:
+            print(text, file=f)
+
+    print0(Path(__file__).read_text(), console=False)
+    for module in SOURCES:
+        print0(f"{'=' * 100}\n# {Path(module.__file__).relative_to(root)}", console=False)
+        print0(Path(module.__file__).read_text(), console=False)
+    print0("=" * 100, console=False)
+    print0(subprocess.run(["nvidia-smi"], capture_output=True, text=True).stdout, console=False)
+    print0(f"run {run_id} | jax {jax.__version__} | {jax.device_count()}x {jax.devices()[0].device_kind}")
+    print0(json.dumps(asdict(hp)))
+
+    mesh = Mesh(np.array(jax.devices()), ("pop",))
+    replicated = NamedSharding(mesh, P())
+    put = lambda x: jax.device_put(x, replicated)
+    cfg = GPTConfig(hp.seq_len, hp.vocab_size, hp.n_layer, hp.n_head, hp.n_embd)
+    params = jax.jit(lambda k: init_params(cfg, k), out_shardings=replicated)(jax.random.key(hp.seed))
+    buffers = jax.jit(init_optimizer, out_shardings=replicated)(params)
+    print0(f"parameters: {sum(x.size for x in jax.tree.leaves(params)):,}")
+    train_rows, val_rows = load_rows(hp, mesh)
+    val_tokens = val_rows[:, :-1].size
+    val_rows = jax.device_put(val_rows, NamedSharding(mesh, P("pop")))
+    batches = train_batches(train_rows, hp.batch_size, hp.seed + 1, hp.max_epochs)
+
+    gather_states = jax.jit(jax.shard_map(lambda st: gather_anvil_states(st, mesh.size), mesh=mesh,
+                                          in_specs=P(), out_specs=P(), check_vma=False))
+    step_fn = make_train_step(cfg, hp, mesh)
+    dummy = lambda length: put(np.zeros((hp.batch_size * hp.seq_len // length, length), np.int32))
+    compile_start = time.perf_counter()
+    lengths = sorted({seq_length(s, hp) for s in range(hp.num_iterations)})
+    train_steps = {length: step_fn.lower(params, buffers, dummy(length), dummy(length), jnp.int32(0),
+                                         jnp.float32(1)).compile() for length in lengths}
+    for length, compiled in train_steps.items():  # first runs (CUDA graphs, collectives' setup) on copies
+        jax.block_until_ready(compiled(jax.tree.map(jnp.copy, params), jax.tree.map(jnp.copy, buffers),
+                                       dummy(length), dummy(length), jnp.int32(0), jnp.float32(1)))
+    evaluate = make_evaluate(cfg, mesh).lower(params, val_rows).compile()
+    val_loss_of = lambda p: float(evaluate(p, val_rows)) / val_tokens
+    print0(f"compiled in {time.perf_counter() - compile_start:.0f}s")
+
+    tokens_through = lambda n: hp.seq_len * hp.batch_size * n
+    step, train_time, reached, final = 0, 0.0, None, None
+    exhausted = False  # the training data ran out: validate once more, then stop
+    kept_steps = {int(x) for x in hp.save_steps.split(",") if x}
+    segment_start = None  # wall clock at the first update dispatched since the last sync point (timed stretch)
+    pending = None  # (step, loss on device) of the last dispatched update, logged once the next one is in flight
+
+    def log_update(done, loss, elapsed):
+        loss = float(loss)
+        print0(f"step:{done}/{hp.num_iterations} train_loss:{loss:.4f} train_time:{elapsed * 1000:.0f}ms "
+               f"step_avg:{elapsed * 1000 / done:.2f}ms")
+        if not math.isfinite(loss):
+            raise SystemExit("non-finite train loss")
+
+    def sync(train_time, segment_start, pending):
+        """End a timed stretch: wait for its updates, add its wall time, log the last update. (train_time, None, None)"""
+        if segment_start is not None:
+            jax.block_until_ready(params)
+            train_time += time.perf_counter() - segment_start
+        if pending:
+            log_update(*pending, train_time)
+        return train_time, None, None
+
+    while True:
+        last = step >= hp.num_iterations or exhausted
+        if last or step % hp.val_every == 0:
+            train_time, segment_start, pending = sync(train_time, segment_start, pending)
+            val_loss = val_loss_of(params)
+            print0(f"step:{step}/{hp.num_iterations} val_loss:{val_loss:.4f} tokens:{tokens_through(step):,} "
+                   f"train_time:{train_time * 1000:.0f}ms step_avg:{train_time * 1000 / max(step, 1):.2f}ms")
+            if last:
+                final = dict(val_loss=val_loss, passed=val_loss <= hp.target)
+            if reached is None and val_loss <= hp.target:
+                reached = dict(step=step, tokens=tokens_through(step), train_time=train_time, val_loss=val_loss)
+                print0(f"reached target {hp.target}: {json.dumps(reached)}")
+        if last:
+            break
+        try:
+            inputs, targets = next(batches)
+        except StopIteration:
+            print0(f"end of training data: max_epochs={hp.max_epochs} epochs of {len(train_rows)} rows")
+            exhausted = True
+            continue
+        if segment_start is None:
+            segment_start = time.perf_counter()
+        length = seq_length(step, hp)
+        inputs, targets = put(inputs.reshape(-1, length)), put(targets.reshape(-1, length))  # rows cut into pieces
+        params, buffers, loss = train_steps[length](params, buffers, inputs, targets, jnp.int32(step),
+                                                    jnp.float32(lr_scale(step, hp)))
+        step += 1
+        if pending:  # the previous update's loss: waits for it only, while this one runs
+            log_update(*pending, train_time + time.perf_counter() - segment_start)
+        pending = (step, loss)
+        if (hp.save_every and step % hp.save_every == 0) or step in kept_steps:
+            train_time, segment_start, pending = sync(train_time, segment_start, pending)
+            buffers = buffers | {"anvil": gather_states(buffers["anvil"])}
+            meta = dict(step=step, train_time=train_time, reached=reached, hparams=asdict(hp))
+            if hp.save_every and step % hp.save_every == 0:
+                save_checkpoint(logs / f"{run_id}.npz", params, buffers, meta)
+            if step in kept_steps:
+                save_checkpoint(logs / f"{run_id}-{step}.npz", params, buffers, meta)
+    print0(f"peak memory per GPU: {jax.devices()[0].memory_stats()['peak_bytes_in_use'] / 2**30:.1f} GiB")
+    print0(f"result: {json.dumps(dict(reached=reached, final=final, steps=step, train_time=train_time))}")
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Export
+# A checkpoint of the JAX trainer as the benchmark's state dict (named float32 arrays in torch layout):
+#
+# The trainer's block weights are (in, out) and its head (d, vocab); torch's Linear stores (out, in), so they are
+# transposed.
+
+
+def noise_state(params):
+    """{state-dict name: array} of `utils/model.py`'s GPT from the trainer's parameter tree."""
+    state = {"transformer.wte.weight": params["wte"], "lm_head.weight": params["lm_head"].T,
+             "resid_lambdas": params["resid_lambdas"], "x0_lambdas": params["x0_lambdas"]}
+    for layer, block in enumerate(params["blocks"]):
+        state |= {f"transformer.h.{layer}.{kind}.weight": w.T for kind, w in block.items()}
+    state |= {f"value_embeds.{i}.weight": w for i, w in params["value_embeds"].items()}
+    return {name: np.asarray(value, np.float32) for name, value in state.items()}
+
+
+def export(path, out):
+    hp = parse_args([])
+    cfg = GPTConfig(hp.seq_len, hp.vocab_size, hp.n_layer, hp.n_head, hp.n_embd)
+    template = init_params(cfg, jax.random.key(0))
+    data = np.load(path)  # the checkpoint's parameters are its arrays p0, p1, ... in the tree's leaf order
+    leaves = [np.asarray(data[f"p{i}"], np.float32) for i in range(len(jax.tree.leaves(template)))]
+    params = jax.tree.unflatten(jax.tree.structure(template), leaves)
+    step = json.loads(str(data["meta"]))["step"]
+    np.savez(out, meta=json.dumps({"step": step, "source": str(path)}), **noise_state(params))
+    print(f"wrote {out} (step {step})")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:2] == ["export"]:
+        export(*sys.argv[2:])
+    else:
+        main()
+
+====================================================================================================
+# kernels/exact_keys.py
+"""Exact keys (and queries) as fused kernels: for every key position t and key direction j, the sum over the
+queries s of the exactly evaluated change of the attention output, scored against each query's attention-output
+credit:
+
+    score[t, j] = sum_s  ch / (1 + ch) * C[s, t],   ch = A[s, t] * (exp(dl_j[s, t]) - 1),
+    A[s, t] = exp(q_s . k_t * scale - lse_s),       dl_j[s, t] = q_s . dk_{t, j} * scale,
+    C[s, t] = hub_s . v_t - hub_s . o_s,            over the causal window (0 <= s - t <= window).
+
+Each program takes one (row, head) and `block_t` key positions and walks the queries that see them in `block_s`
+tiles: the attention weights, the scores and the logit changes are formed in the tile and never stored. lse_s and
+o_s come from the clean attention. `reference` / `query_reference` evaluate the same scores in plain jnp from explicit
+change tensors dk / dq.
+
+A query move changes only its own output, through all of its weights: with ch = A[s, t] * (exp(dl_j[s, t]) - 1),
+dl_j = dq_{s, j} . k_t * scale, the new output is o_s + sum_t ch C[s, t] / (1 + sum_t ch) scored against the hub credit
+(sum_t A C = 0), which `closed_query_scores` sums over the keys in tiles.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pltr
+
+
+def reference(q, k, v, hub, dk, lse, hub_out, window):
+    """Plain jnp: q, k, v, hub [BH, T, D]; dk [BH, J, T, D]; lse, hub_out [BH, T] -> [BH, T, J] fp32."""
+    t, d = q.shape[1], q.shape[2]
+    scale = d ** -0.5
+    f32 = lambda x: x.astype(jnp.float32)
+    lag = jnp.arange(t)[:, None] - jnp.arange(t)[None, :]
+    allowed = (lag >= 0) & (lag <= window)
+    a = jnp.where(allowed, jnp.exp(jnp.einsum("bsd,btd->bst", f32(q), f32(k)) * scale - lse[..., None]), 0.0)
+    c = jnp.einsum("bsd,btd->bst", f32(hub), f32(v)) - hub_out[..., None]
+    dl = jnp.einsum("bsd,bjtd->bjst", f32(q), f32(dk)) * scale
+    ch = a[:, None] * jnp.expm1(dl)
+    return jnp.moveaxis(jnp.sum(ch / (1 + ch) * c[:, None], axis=2), 1, 2)
+
+
+def query_reference(q, k, v, hub, dq, lse, hub_out, window):
+    """Plain jnp: q, k, v, hub [BH, T, D]; dq [BH, J, T, D]; lse, hub_out [BH, T] -> [BH, T, J] fp32."""
+    t, d = q.shape[1], q.shape[2]
+    scale = d ** -0.5
+    f32 = lambda x: x.astype(jnp.float32)
+    lag = jnp.arange(t)[:, None] - jnp.arange(t)[None, :]
+    allowed = (lag >= 0) & (lag <= window)
+    a = jnp.where(allowed, jnp.exp(jnp.einsum("bsd,btd->bst", f32(q), f32(k)) * scale - lse[..., None]), 0.0)
+    c = jnp.einsum("bsd,btd->bst", f32(hub), f32(v)) - hub_out[..., None]
+    ch = a[:, None] * jnp.expm1(jnp.einsum("bjsd,btd->bjst", f32(dq), f32(k)) * scale)
+    return jnp.moveaxis(jnp.sum(ch * c[:, None], -1) / (1 + jnp.sum(ch, -1)), 1, 2)
+
+
+def _expm1_small(x):
+    """exp(x) - 1 to degree 3 for the closed-form kernels' logit changes (|x| <~ 0.01: relative error x^3 / 24)."""
+    return x * (1.0 + x * (0.5 + x * (1.0 / 6)))
+
+
+def value_reference(q, k, hub, lse, window):
+    """Plain jnp: the values' exact credit sum_s A[s, t] hub_s, [BH, T, D] fp32."""
+    t, d = q.shape[1], q.shape[2]
+    lag = jnp.arange(t)[:, None] - jnp.arange(t)[None, :]
+    allowed = (lag >= 0) & (lag <= window)
+    f32 = lambda x: x.astype(jnp.float32)
+    a = jnp.where(allowed, jnp.exp(jnp.einsum("bsd,btd->bst", f32(q), f32(k)) * d ** -0.5 - lse[..., None]), 0.0)
+    return jnp.einsum("bst,bsd->btd", a, f32(hub))
+
+
+def _value_kernel(q_ref, k_ref, hub_ref, lse_ref, out_ref, *, window, block_s):
+    t_total, d = q_ref.shape
+    block_t = k_ref.shape[0]
+    scale = d ** -0.5
+    t0 = pl.program_id(1) * block_t
+    k = k_ref[...]
+    key_pos = t0 + jnp.arange(block_t)
+    first = t0 // block_s
+    last = jnp.minimum((t0 + block_t - 1 + window) // block_s + 1, t_total // block_s)
+
+    def tile(i, total):
+        s0 = i * block_s
+        q, hub = q_ref[pl.ds(s0, block_s), :], hub_ref[pl.ds(s0, block_s), :]
+        lse = lse_ref[pl.ds(s0, block_s)]
+        lag = (s0 + jnp.arange(block_s))[:, None] - key_pos[None, :]
+        allowed = (lag >= 0) & (lag <= window)
+        logits = jax.lax.dot_general(q, k, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+        a = jnp.where(allowed, jnp.exp(logits * scale - lse[:, None]), 0.0)
+        return total + jax.lax.dot_general(a.astype(hub.dtype), hub, (((0,), (0,)), ((), ())),
+                                           preferred_element_type=jnp.float32)
+
+    out_ref[...] = jax.lax.fori_loop(first, last, tile, jnp.zeros((block_t, d), jnp.float32))
+
+
+@functools.partial(jax.jit, static_argnames=("window", "block_t", "block_s", "num_warps", "num_stages"))
+def value_credit(q, k, hub, lse, window, block_t=64, block_s=64, num_warps=4, num_stages=2):
+    """The values' exact credit sum_s A[s, t] hub_s [BH, T, D] (fp32): q, k, hub [BH, T, D] (cast to bf16), lse
+    [BH, T] fp32 from the clean attention. Moving position t's value moves query s's output by A[s, t] times the move."""
+    bh, t, d = q.shape
+    if t % block_t or t % block_s:
+        raise ValueError(f"T {t} must divide by the blocks {block_t} / {block_s}")
+    b16 = lambda x: x.astype(jnp.bfloat16)
+    row = lambda: pl.BlockSpec((None, t, d), lambda i, j: (i, 0, 0))
+    return pl.pallas_call(
+        functools.partial(_value_kernel, window=window, block_s=block_s),
+        grid=(bh, t // block_t),
+        in_specs=[row(), pl.BlockSpec((None, block_t, d), lambda i, j: (i, j, 0)), row(),
+                  pl.BlockSpec((None, t), lambda i, j: (i, 0))],
+        out_specs=pl.BlockSpec((None, block_t, d), lambda i, j: (i, j, 0)),
+        out_shape=jax.ShapeDtypeStruct((bh, t, d), jnp.float32),
+        compiler_params=pltr.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+        name="exact_values",
+    )(b16(q), b16(k), b16(hub), lse.astype(jnp.float32))
+
+
+# Closed-form changes. A raw key (query) step s e_j moves the processed (rotated, RMS-normed) key by
+# A k_hat + B R e_j: A = r' / r - 1 from the norm's change (|x|^2 + 2 s x_j + s^2), B = s r', and R e_j touches only
+# dims i = j mod d/2 and i + d/2 with the rotation's (cos, -sin) or (sin, cos) at that position. So each direction's
+# logit change is dl_j[s, t] = scale (A_tj S[s, t] + B_tj (u_tj q_s[i] + w_tj q_s[i + d/2])), S = q_s . k_t: the same
+# exactly evaluated experiments as `reference` / `query_reference`, with no per-direction dot and no change tensors.
+
+
+def closed_coefficients(raw, cos, sin, dims, sigma):
+    """For moves of `raw` [BH, T, D] (f32) by sigma times its RMS along the dims `dims` [J]: coefficients
+    [BH, 3, T, J] (A, B u, B w) and the steps [BH, T, 1]. cos, sin [T, D/2]: the rotation at each position."""
+    d = raw.shape[-1]
+    half = d // 2
+    sq = jnp.sum(raw * raw, -1, keepdims=True)
+    steps = sigma * jnp.maximum(jnp.sqrt(sq / d), 1e-6)
+    change = (2 * steps * raw[..., dims] + steps * steps) / d / (sq / d + 1e-6)  # relative change of the mean square
+    a = jnp.expm1(-0.5 * jnp.log1p(change))  # r' / r - 1
+    b = steps * jax.lax.rsqrt(sq / d + 1e-6) * (1 + a)  # s r'
+    i = dims % half
+    first = (dims < half)[None, :]
+    u = jnp.where(first, cos[:, i], sin[:, i])  # [T, J]
+    w = jnp.where(first, -sin[:, i], cos[:, i])
+    return jnp.stack([a, b * u, b * w], 1), steps
+
+
+def rotated_columns(processed, dims):
+    """The processed (rotated, normed) vectors' columns [BH, 2, T, J] (i, i + D/2) that a move along dims j touches."""
+    half = processed.shape[-1] // 2
+    i = dims % half
+    return jnp.stack([processed[..., i], processed[..., i + half]], 1)
+
+
+def _closed_kernel(q_ref, k_ref, v_ref, hub_ref, coef_ref, qcols_ref, lse_ref, hub_out_ref, out_ref, *, window,
+                   block_s, directions):
+    t_total, d = q_ref.shape
+    block_t = k_ref.shape[0]
+    scale = d ** -0.5
+    t0 = pl.program_id(1) * block_t
+    k, v = k_ref[...], v_ref[...]
+    key_pos = t0 + jnp.arange(block_t)
+    first = t0 // block_s
+    last = jnp.minimum((t0 + block_t - 1 + window) // block_s + 1, t_total // block_s)
+    coef = [[coef_ref[c, pl.ds(j, 1), :] for c in range(3)] for j in range(directions)]  # each [1, block_t]
+
+    def tile(i, totals):  # totals: per direction, [block_s, block_t] partial sums, reduced over s once at the end
+        s0 = i * block_s
+        q = q_ref[pl.ds(s0, block_s), :]
+        hub = hub_ref[pl.ds(s0, block_s), :]
+        lse = lse_ref[pl.ds(s0, block_s)]
+        hub_out = hub_out_ref[pl.ds(s0, block_s)]
+        lag = (s0 + jnp.arange(block_s))[:, None] - key_pos[None, :]
+        allowed = (lag >= 0) & (lag <= window)
+        dot = lambda x, y: jax.lax.dot_general(x, y, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+        logits = dot(q, k) * scale
+        a = jnp.where(allowed, jnp.exp(logits - lse[:, None]), 0.0)
+        c = dot(hub, v) - hub_out[:, None]
+        new = []
+        for j in range(directions):
+            qa = qcols_ref[0, pl.ds(s0, block_s), pl.ds(j, 1)]  # [block_s, 1]
+            qb = qcols_ref[1, pl.ds(s0, block_s), pl.ds(j, 1)]
+            dl = coef[j][0] * logits + scale * (coef[j][1] * qa + coef[j][2] * qb)
+            ch = a * _expm1_small(dl)
+            new.append(totals[j] + ch * (1.0 - ch * (1.0 - ch)) * c)  # ch / (1 + ch), |ch| <~ 0.01
+        return tuple(new)
+
+    init = tuple(jnp.zeros((block_s, block_t), jnp.float32) for _ in range(directions))
+    totals = jax.lax.fori_loop(first, last, tile, init)
+    for j in range(directions):
+        out_ref[:, j] = jnp.sum(totals[j], axis=0)
+
+
+@functools.partial(jax.jit, static_argnames=("window", "block_t", "block_s", "num_warps", "num_stages"))
+def closed_scores(q, k, v, hub, coef, qcols, lse, hub_out, window, block_t=64, block_s=16, num_warps=4,
+                  num_stages=2):
+    """The key scores (module docstring) from closed_coefficients' key coefficients coef [BH, 3, J, T] and query
+    columns qcols [BH, 2, T, J]."""
+    bh, t, d = q.shape
+    directions = coef.shape[2]
+    if t % block_t or t % block_s:
+        raise ValueError(f"T {t} must divide by the blocks {block_t} / {block_s}")
+    b16 = lambda x: x.astype(jnp.bfloat16)
+    row = lambda: pl.BlockSpec((None, t, d), lambda i, j: (i, 0, 0))
+    return pl.pallas_call(
+        functools.partial(_closed_kernel, window=window, block_s=block_s, directions=directions),
+        grid=(bh, t // block_t),
+        in_specs=[
+            row(),
+            pl.BlockSpec((None, block_t, d), lambda i, j: (i, j, 0)),
+            pl.BlockSpec((None, block_t, d), lambda i, j: (i, j, 0)),
+            row(),
+            pl.BlockSpec((None, 3, directions, block_t), lambda i, j: (i, 0, 0, j)),
+            pl.BlockSpec((None, 2, t, directions), lambda i, j: (i, 0, 0, 0)),
+            pl.BlockSpec((None, t), lambda i, j: (i, 0)),
+            pl.BlockSpec((None, t), lambda i, j: (i, 0)),
+        ],
+        out_specs=pl.BlockSpec((None, block_t, directions), lambda i, j: (i, j, 0)),
+        out_shape=jax.ShapeDtypeStruct((bh, t, directions), jnp.float32),
+        compiler_params=pltr.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+        name="closed_keys",
+    )(b16(q), b16(k), b16(v), b16(hub), coef.astype(jnp.float32), qcols.astype(jnp.float32), lse.astype(jnp.float32),
+      hub_out.astype(jnp.float32))
+
+
+def _closed_query_kernel(q_ref, k_ref, v_ref, hub_ref, coef_ref, kcols_ref, lse_ref, hub_out_ref, out_ref, *,
+                         window, block_t, directions):
+    d = k_ref.shape[1]
+    block_s = q_ref.shape[0]
+    scale = d ** -0.5
+    s0 = pl.program_id(1) * block_s
+    q, hub = q_ref[...], hub_ref[...]
+    lse, hub_out = lse_ref[...], hub_out_ref[...]
+    coef = [[coef_ref[c, :, pl.ds(j, 1)] for c in range(3)] for j in range(directions)]  # each [block_s, 1]
+    query_pos = s0 + jnp.arange(block_s)
+    first = jnp.maximum(s0 - window, 0) // block_t
+    last = (s0 + block_s - 1) // block_t + 1
+
+    def tile(i, totals):
+        t0 = i * block_t
+        k = k_ref[pl.ds(t0, block_t), :]
+        v = v_ref[pl.ds(t0, block_t), :]
+        lag = query_pos[:, None] - (t0 + jnp.arange(block_t))[None, :]
+        allowed = (lag >= 0) & (lag <= window)
+        dot = lambda x, y: jax.lax.dot_general(x, y, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+        logits = dot(q, k) * scale
+        a = jnp.where(allowed, jnp.exp(logits - lse[:, None]), 0.0)
+        c = dot(hub, v) - hub_out[:, None]
+        new = []
+        for j in range(directions):
+            ka = kcols_ref[0, pl.ds(j, 1), pl.ds(t0, block_t)]  # [1, block_t]
+            kb = kcols_ref[1, pl.ds(j, 1), pl.ds(t0, block_t)]
+            dl = coef[j][0] * logits + scale * (coef[j][1] * ka + coef[j][2] * kb)
+            ch = a * _expm1_small(dl)
+            new.append((totals[j][0] + jnp.sum(ch * c, axis=1), totals[j][1] + jnp.sum(ch, axis=1)))
+        return tuple(new)
+
+    zero = lambda: jnp.zeros((block_s,), jnp.float32)
+    totals = jax.lax.fori_loop(first, last, tile, tuple((zero(), zero()) for _ in range(directions)))
+    for j in range(directions):
+        out_ref[:, j] = totals[j][0] / (1.0 + totals[j][1])
+
+
+@functools.partial(jax.jit, static_argnames=("window", "block_t", "block_s", "num_warps", "num_stages"))
+def closed_query_scores(q, k, v, hub, coef, kcols, lse, hub_out, window, block_t=64, block_s=128, num_warps=8,
+                        num_stages=2):
+    """The query scores (module docstring) from closed_coefficients' query coefficients coef [BH, 3, T, J] and key
+    columns kcols [BH, 2, J, T]."""
+    bh, t, d = q.shape
+    directions = coef.shape[3]
+    if t % block_t or t % block_s:
+        raise ValueError(f"T {t} must divide by the blocks {block_t} / {block_s}")
+    b16 = lambda x: x.astype(jnp.bfloat16)
+    row = lambda: pl.BlockSpec((None, t, d), lambda i, j: (i, 0, 0))
+    block = lambda: pl.BlockSpec((None, block_s, d), lambda i, j: (i, j, 0))
+    vector = lambda: pl.BlockSpec((None, block_s), lambda i, j: (i, j))
+    return pl.pallas_call(
+        functools.partial(_closed_query_kernel, window=window, block_t=block_t, directions=directions),
+        grid=(bh, t // block_s),
+        in_specs=[block(), row(), row(), block(),
+                  pl.BlockSpec((None, 3, block_s, directions), lambda i, j: (i, 0, j, 0)),
+                  pl.BlockSpec((None, 2, directions, t), lambda i, j: (i, 0, 0, 0)), vector(), vector()],
+        out_specs=pl.BlockSpec((None, block_s, directions), lambda i, j: (i, j, 0)),
+        out_shape=jax.ShapeDtypeStruct((bh, t, directions), jnp.float32),
+        compiler_params=pltr.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+        name="closed_queries",
+    )(b16(q), b16(k), b16(v), b16(hub), coef.astype(jnp.float32), kcols.astype(jnp.float32), lse.astype(jnp.float32),
+      hub_out.astype(jnp.float32))
+
+====================================================================================================
+# kernels/probe_cycle.py
+"""Boost's readout probes: for every token n and probe direction p, the partition function of the soft-capped head at
+the moved stream, without materializing the [tokens, directions, vocab] logits:
+
+    total[n, p] = sum_v exp(c tanh(z / c)),  z = (base[n, v] + step[n] C[p, v]) * inv[n, p],  c = 15
+
+(base = the clean stream's raw logits, C = each direction's logits, inv = the moved stream's inverse RMS). Each
+program takes `block_rows` tokens and `block_dirs` directions and walks the vocabulary in `block_vocab` tiles: a tile
+of base stays in registers while the program loops over its directions, so each direction's logit row is read once
+per tile and token block. exp(softcap(z)) uses head_ce's hardware ex2 / rcp approximations (~1e-6 relative); the
+softcap bounds z to [-15, 15], so no running max is needed.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pltr
+
+from kernels.head_ce import SOFTCAP, _exp_softcap
+
+
+def reference(base, c, steps, inv):
+    """Plain-jnp partition functions: base [N, V], c [P, V], steps [N, 1], inv [N, P] -> [N, P] fp32."""
+    z = (base[:, None, :] + steps[:, :, None] * c[None]) * inv[..., None]
+    return jnp.sum(jnp.exp(SOFTCAP * jnp.tanh(z / SOFTCAP)), axis=-1)
+
+
+def _kernel(base_ref, c_ref, steps_ref, inv_ref, out_ref, *, block_dirs, block_vocab):
+    rows, vocab = base_ref.shape
+    steps = steps_ref[...]  # [rows]
+
+    def tile(j, totals):
+        base = base_ref[:, pl.ds(j * block_vocab, block_vocab)]  # [rows, block_vocab]
+
+        def direction(p, totals):
+            row = c_ref[pl.ds(p, 1), pl.ds(j * block_vocab, block_vocab)]  # [1, block_vocab]
+            inv = inv_ref[:, pl.ds(p, 1)]  # [rows, 1]
+            terms = _exp_softcap((base + steps[:, None] * row) * inv).sum(axis=1)  # [rows]
+            column = jnp.arange(block_dirs)[None, :] == p
+            return totals + jnp.where(column, terms[:, None], 0.0)
+
+        return jax.lax.fori_loop(0, block_dirs, direction, totals)
+
+    out_ref[...] = jax.lax.fori_loop(0, vocab // block_vocab, tile, jnp.zeros((rows, block_dirs), jnp.float32))
+
+
+def _kernel3d(base_ref, c_ref, steps_ref, inv_ref, out_ref, *, block_vocab):
+    """One [rows, dirs, block_vocab] block per vocabulary tile: no loop over the directions."""
+    vocab = base_ref.shape[1]
+    steps, inv = steps_ref[...][:, None, None], inv_ref[...][:, :, None]
+
+    def tile(j, totals):
+        base = base_ref[:, pl.ds(j * block_vocab, block_vocab)][:, None, :]
+        rows_c = c_ref[:, pl.ds(j * block_vocab, block_vocab)][None, :, :]
+        return totals + _exp_softcap((base + steps * rows_c) * inv).sum(axis=2)
+
+    out_ref[...] = jax.lax.fori_loop(0, vocab // block_vocab, tile, jnp.zeros(out_ref.shape, jnp.float32))
+
+
+@functools.partial(jax.jit, static_argnames=("block_rows", "block_dirs", "block_vocab", "num_warps", "num_stages",
+                                             "flat"))
+def partitions(base, c, steps, inv, block_rows=64, block_dirs=16, block_vocab=256, num_warps=8, num_stages=2,
+               flat=False):
+    """total[n, p] (module docstring): base [N, V] f32, c [P, V] f32, steps [N, 1], inv [N, P] -> [N, P] fp32. V must be
+    a multiple of block_vocab (the caller passes the unpadded vocabulary)."""
+    n, vocab = base.shape
+    dirs = c.shape[0]
+    if n % block_rows or dirs % block_dirs or vocab % block_vocab:
+        raise ValueError(f"tokens {n} / directions {dirs} / vocab {vocab} must divide by the blocks")
+    return pl.pallas_call(
+        (functools.partial(_kernel3d, block_vocab=block_vocab) if flat
+         else functools.partial(_kernel, block_dirs=block_dirs, block_vocab=block_vocab)),
+        grid=(n // block_rows, dirs // block_dirs),
+        in_specs=[
+            pl.BlockSpec((block_rows, vocab), lambda i, j: (i, 0)),
+            pl.BlockSpec((block_dirs, vocab), lambda i, j: (j, 0)),
+            pl.BlockSpec((block_rows,), lambda i, j: (i,)),
+            pl.BlockSpec((block_rows, block_dirs), lambda i, j: (i, j)),
+        ],
+        out_specs=pl.BlockSpec((block_rows, block_dirs), lambda i, j: (i, j)),
+        out_shape=jax.ShapeDtypeStruct((n, dirs), jnp.float32),
+        compiler_params=pltr.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+        name="probe_cycle",
+    )(base.astype(jnp.float32), c.astype(jnp.float32), steps.reshape(-1).astype(jnp.float32), inv.astype(jnp.float32))
+
+====================================================================================================
+# kernels/head_ce.py
+"""Per-token cross-entropy of the soft-capped LM head, without materializing the [rows, vocab] logits.
+
+loss = log sum_v exp(c tanh(z_v / c)) - c tanh(z_target / c), z = x @ W, c = 15. Each program takes `block_rows`
+rows of x and walks the vocabulary in `block_vocab` tiles (K-looped bf16 dot, fp32 accumulate), adding
+exp(softcap(z)) to a running sum; the logits never leave the SM. The softcap bounds every logit to [-15, 15], so the
+sum needs no running max (at most 50k x e^15 ~ 2e11). The target logit is one row-wise dot outside the kernel.
+exp(softcap(z)) uses only the hardware ex2 / rcp approximations, accurate to ~1e-6 relative.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pltr
+
+SOFTCAP = 15.0
+LOG2E = 1.4426950408889634
+
+
+def reference(x, w, targets, vocab_size):
+    """Plain-jnp per-token loss with fp32 logits: x [N, D], w [D, V_padded], targets [N] -> [N] fp32."""
+    logits = jnp.dot(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16), preferred_element_type=jnp.float32)
+    logits = SOFTCAP * jnp.tanh(logits / SOFTCAP)
+    logits = jnp.where(jnp.arange(logits.shape[-1]) < vocab_size, logits, -jnp.inf)
+    target_logit = jnp.take_along_axis(logits, targets[:, None], axis=-1)[:, 0]
+    return jax.nn.logsumexp(logits, axis=-1) - target_logit
+
+
+def _approx(op, x):
+    asm, like = f"{op}.approx.ftz.f32 $0, $1;", [jax.ShapeDtypeStruct.like(x)]
+    [result] = pltr.elementwise_inline_asm(asm, args=[x], constraints="=f,f", pack=1, result_shape_dtypes=like)
+    return result
+
+
+def _exp_softcap(z):
+    """exp(c tanh(z / c)) = 2^(c log2(e) (1 - 2 / (1 + 2^(2 z log2(e) / c)))): hardware ex2 / rcp, ~1e-6 relative
+    (tanh.approx would err by up to ~1e-3 near saturation, biasing the loss of confident tokens)."""
+    tanh = 1 - 2 * _approx("rcp", 1 + _approx("ex2", z * (2 * LOG2E / SOFTCAP)))
+    return _approx("ex2", tanh * (SOFTCAP * LOG2E))
+
+
+def _kernel(x_ref, w_ref, lse_ref, *, vocab_size, block_vocab, block_k):
+    rows, d = x_ref.shape
+
+    def logits_tile(j):
+        def accumulate(k, acc):
+            x = x_ref[:, pl.ds(k * block_k, block_k)]  # [block_rows, block_k] bf16
+            w = w_ref[pl.ds(j * block_vocab, block_vocab), pl.ds(k * block_k, block_k)]  # [block_vocab, block_k]
+            return acc + jax.lax.dot_general(x, w, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+
+        return jax.lax.fori_loop(0, d // block_k, accumulate, jnp.zeros((rows, block_vocab), jnp.float32))
+
+    full_tiles = vocab_size // block_vocab
+    add_tile = lambda j, total: total + _exp_softcap(logits_tile(j)).sum(axis=1)
+    total = jax.lax.fori_loop(0, full_tiles, add_tile, jnp.zeros((rows,), jnp.float32))
+    if vocab_size % block_vocab:  # the partial last tile; later (all-padding) tiles are skipped
+        columns = full_tiles * block_vocab + jnp.arange(block_vocab)
+        terms = _exp_softcap(logits_tile(full_tiles))
+        total += jnp.where(columns[None, :] < vocab_size, terms, 0.0).sum(axis=1)
+    lse_ref[...] = jnp.log(total)
+
+
+@functools.partial(
+    jax.jit, static_argnames=("vocab_size", "block_rows", "block_vocab", "block_k", "num_warps", "num_stages")
+)
+def head_ce(x, w, targets, vocab_size, block_rows=128, block_vocab=256, block_k=64, num_warps=8, num_stages=3):
+    """Per-token loss of softcap(x @ w) over the first vocab_size columns: x [N, D], w [D, V_padded], targets [N].
+    Defaults: the fastest tiling on H100 at 262k rows for vocab 4096 and 50257 (from a tiling sweep)."""
+    n, d = x.shape
+    if n % block_rows or d % block_k or w.shape[1] < pl.cdiv(vocab_size, block_vocab) * block_vocab:
+        raise ValueError(f"rows {n} / width {d} must divide by {block_rows} / {block_k}; vocab tiles must fit w")
+    x = x.astype(jnp.bfloat16)
+    w_rows = w.astype(jnp.bfloat16).T  # [V_padded, D]: one contiguous row per vocabulary entry
+    lse = pl.pallas_call(
+        functools.partial(_kernel, vocab_size=vocab_size, block_vocab=block_vocab, block_k=block_k),
+        grid=(n // block_rows,),
+        in_specs=[pl.BlockSpec((block_rows, d), lambda i: (i, 0)), pl.BlockSpec(w_rows.shape, lambda i: (0, 0))],
+        out_specs=pl.BlockSpec((block_rows,), lambda i: (i,)),
+        out_shape=jax.ShapeDtypeStruct((n,), jnp.float32),
+        compiler_params=pltr.CompilerParams(num_warps=num_warps, num_stages=num_stages),
+        name="head_ce",
+    )(x, w_rows)
+    target_logit = jnp.einsum("nd,nd->n", x, w_rows[targets], preferred_element_type=jnp.float32)
+    return lse - SOFTCAP * jnp.tanh(target_logit / SOFTCAP)
+
+====================================================================================================
+# kernels/relu2_matmul.py
+"""relu(x @ w)² with the activation in the matmul epilogue (Hopper, Pallas Mosaic GPU).
+
+The MLP's first layer: XLA runs it as a cuBLAS matmul with a fused relu, then squares in a separate kernel (a full
+extra read + write of the [rows, 4d] activation). Here the square happens on the fp32 accumulator before the bf16
+store. Adapted from jax/experimental/pallas/ops/gpu/hopper_matmul_mgpu.py (Apache-2.0, The JAX Authors):
+warp-specialized TMA pipeline, two compute warpgroups issuing wgmma, persistent grid over output tiles.
+"""
+
+import dataclasses
+import functools
+
+import jax
+import jax.experimental.pallas as pl
+import jax.experimental.pallas.mosaic_gpu as plgpu
+import jax.numpy as jnp
+from jax import lax
+from jax.experimental.pallas.ops.gpu.hopper_matmul_mgpu import MatmulDimension, get_num_sms
+
+
+def reference(x, w):
+    """Plain-jnp relu(x @ w)² as the trainer computed it (bf16 matmul output, square in bf16)."""
+    return jnp.square(jax.nn.relu(jnp.dot(x.astype(jnp.bfloat16), w.astype(jnp.bfloat16))))
+
+
+@dataclasses.dataclass(frozen=True)
+class Tiling:
+    """Defaults: the fastest tiling for [262144, 512] x [512, 2048] on H100 (from a tiling sweep)."""
+
+    tile_m: int = 64
+    tile_n: int = 256
+    tile_k: int = 64
+    max_concurrent_steps: int = 4
+    epi_tile_m: int = 64
+    epi_tile_n: int = 64
+    grid_minor_dim: MatmulDimension = MatmulDimension.M
+    grid_tile_width: int = 4
+    wg_dimension: MatmulDimension = MatmulDimension.M
+
+
+def _kernel(a_gmem, b_gmem, out_gmem, tiling: Tiling):
+    dtype, out_dtype = a_gmem.dtype, out_gmem.dtype
+    m, k = a_gmem.shape
+    _, n = b_gmem.shape
+    tile_m, tile_n, tile_k = tiling.tile_m, tiling.tile_n, tiling.tile_k
+    swizzle = plgpu.find_swizzle(tile_k * jnp.dtype(dtype).itemsize * 8)
+    transforms = (plgpu.TilingTransform((8, swizzle // jnp.dtype(dtype).itemsize)), plgpu.SwizzleTransform(swizzle))
+    cta_tile_m = tile_m * (1 + (tiling.wg_dimension == MatmulDimension.M))
+    cta_tile_n = tile_n * (1 + (tiling.wg_dimension == MatmulDimension.N))
+    if m % cta_tile_m or n % cta_tile_n or k % tile_k:
+        raise ValueError(f"({m}, {n}, {k}) must divide by ({cta_tile_m}, {cta_tile_n}, {tile_k})")
+    m_iters, n_iters, k_iters = m // cta_tile_m, n // cta_tile_n, k // tile_k
+    epi_tile_m, epi_tile_n = tiling.epi_tile_m, tiling.epi_tile_n
+    num_out_slots = min(2, (tile_m * tile_n) // (epi_tile_m * epi_tile_n))
+    out_swizzle = plgpu.find_swizzle(epi_tile_n * jnp.dtype(out_dtype).itemsize * 8)
+    out_transforms = (
+        plgpu.TilingTransform((8, out_swizzle // jnp.dtype(out_dtype).itemsize)),
+        plgpu.SwizzleTransform(out_swizzle),
+    )
+
+    def get_pipeline(pipeline_body, compute_context):
+        return plgpu.emit_pipeline_warp_specialized(
+            pipeline_body,
+            grid=(k_iters,),
+            memory_registers=40,
+            in_specs=[
+                plgpu.BlockSpec((cta_tile_m, tile_k), lambda k: (0, k), transforms=transforms, memory_space=plgpu.SMEM),
+                plgpu.BlockSpec((tile_k, cta_tile_n), lambda k: (k, 0), transforms=transforms, memory_space=plgpu.SMEM),
+            ],
+            wg_axis="wg",
+            num_compute_wgs=2,
+            max_concurrent_steps=tiling.max_concurrent_steps,
+            compute_context=compute_context,
+        )
+
+    ignore = lambda *_, **__: None
+
+    @functools.partial(
+        pl.run_scoped,
+        pipeline_allocs=get_pipeline(ignore, ignore).get_allocations(a_gmem, b_gmem),
+        out_smem=plgpu.SMEM((2, num_out_slots, epi_tile_m, epi_tile_n), out_dtype, transforms=out_transforms),
+        collective_axes="wg",
+    )
+    def _pipeline_scope(pipeline_allocs, out_smem):
+        wg_idx = lax.axis_index("wg")
+
+        @plgpu.nd_loop((m_iters * n_iters,), collective_axes="cluster_grid")
+        def _mn_loop(loop_info: plgpu.NDLoopInfo):
+            (lin_idx,) = loop_info.index
+            m_idx, n_idx = plgpu.planar_snake(
+                lin_idx, (m_iters, n_iters), tiling.grid_minor_dim, tiling.grid_tile_width
+            )
+            cta_m_slice = pl.ds(m_idx * cta_tile_m, cta_tile_m)
+            cta_n_slice = pl.ds(n_idx * cta_tile_n, cta_tile_n)
+            if tiling.wg_dimension == MatmulDimension.M:
+                wg_m_slice, wg_n_slice = pl.ds(wg_idx * tile_m, tile_m), slice(None)
+            else:
+                wg_m_slice, wg_n_slice = slice(None), pl.ds(wg_idx * tile_n, tile_n)
+
+            def compute_context(eval_pipeline):
+                @functools.partial(pl.run_scoped, acc_ref=plgpu.ACC((tile_m, tile_n), jnp.float32))
+                def _acc_scope(acc_ref):
+                    eval_pipeline(acc_ref)
+                    acc = acc_ref[...]
+                    acc = jnp.square(jnp.maximum(acc, 0.0)).astype(out_dtype)  # the fused relu² epilogue
+                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                    for epi_mi in range(tile_m // epi_tile_m):
+                        for epi_ni in range(tile_n // epi_tile_n):
+                            epi_m_slice = slice(epi_mi * epi_tile_m, (epi_mi + 1) * epi_tile_m)
+                            epi_n_slice = slice(epi_ni * epi_tile_n, (epi_ni + 1) * epi_tile_n)
+                            slot = (epi_mi * (tile_n // epi_tile_n) + epi_ni) % 2
+                            plgpu.wait_smem_to_gmem(1, wait_read_only=True)
+                            out_smem[wg_idx, slot] = acc[epi_m_slice, epi_n_slice]
+                            plgpu.commit_smem()
+                            tile_out = out_gmem.at[cta_m_slice, cta_n_slice].at[wg_m_slice, wg_n_slice]
+                            plgpu.copy_smem_to_gmem(out_smem.at[wg_idx, slot], tile_out.at[epi_m_slice, epi_n_slice])
+
+            def mma_body(_, a_smem, b_smem, acc_ref):
+                plgpu.wgmma(acc_ref, a_smem.at[wg_m_slice], b_smem.at[:, wg_n_slice])
+                plgpu.wgmma_wait(0)
+                return acc_ref
+
+            get_pipeline(mma_body, compute_context)(
+                a_gmem.at[cta_m_slice, :], b_gmem.at[:, cta_n_slice], allocations=pipeline_allocs
+            )
+
+    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+
+
+@functools.partial(jax.jit, static_argnames=("tiling",))
+def relu2_matmul(x, w, tiling=Tiling()):
+    """relu(x @ w)² in bf16: x [M, K], w [K, N] (cast to bf16), fp32 accumulate and activation."""
+    x, w = x.astype(jnp.bfloat16), w.astype(jnp.bfloat16)
+    kernel = plgpu.kernel(
+        functools.partial(_kernel, tiling=tiling),
+        out_type=jax.ShapeDtypeStruct((x.shape[0], w.shape[1]), jnp.bfloat16),
+        grid=(get_num_sms(),),
+        grid_names=("cluster_grid",),
+        cluster=(1,),
+        cluster_names=("cluster",),
+        num_threads=3,
+        thread_name="wg",
+        compiler_params=plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup),
+    )
+    return kernel(x, w)
+
+====================================================================================================
+# kernels/residual_norm.py
+"""Residual add (+ jitter, + x0 mixing) and RMS norm in one pass over the fp32 residual stream (Pallas Triton).
+
+XLA materializes `x + delta`, `lambda x + mu x0` and `norm(...)` as separate fp32 [rows, 512] passes, so a block reads
+and writes the residual stream ~4 times between its matmuls. Here each program loads a block of rows once and writes
+the new stream (fp32) and its RMS-normed bf16 copy: the next matmul's input.
+
+delta is a bf16 matmul output; jitter, when given, is `sigma * noise` added to it with the trainer's bf16 rounding
+(`_jitter`: sigma becomes bf16, then a bf16 product and a bf16 sum). Every operand may have fewer rows than the
+output, dividing them: rerun copies of a batch then share one array (row r reads row r % rows of that operand), so the
+cached clean state is never tiled in memory.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pltr
+
+EPS = 1e-6
+BLOCK_ROWS = 16  # the fastest tiling on H100 for [262144, 512] (~2.8 TB/s)
+NUM_WARPS = 4
+
+
+def _round_bf16(x):
+    return x.astype(jnp.bfloat16).astype(jnp.float32)
+
+
+def _norm(x):
+    return x * jax.lax.rsqrt(jnp.mean(x * x, axis=1, keepdims=True) + EPS)
+
+
+def _kernel(*refs, sigma, has_delta, has_noise, has_x0):
+    refs = list(refs)
+    scales_ref = refs.pop(0) if has_x0 else None
+    x = refs.pop(0)[...]
+    if has_delta:
+        delta = refs.pop(0)[...].astype(jnp.float32)
+        if has_noise:
+            delta = _round_bf16(delta + _round_bf16(sigma * refs.pop(0)[...].astype(jnp.float32)))
+        x = x + delta
+    if has_x0:
+        x = scales_ref[0] * x + scales_ref[1] * refs.pop(0)[...]
+    out_ref, normed_ref = refs
+    out_ref[...] = x
+    normed_ref[...] = _norm(x).astype(jnp.bfloat16)
+
+
+def _bf16(sigma):
+    """A Python float times a bf16 array is a bf16 product: sigma is rounded to bf16 first."""
+    return float(np.asarray(sigma, jnp.bfloat16))
+
+
+def _call(x, delta, noise, x0, scales, sigma):
+    operands = [a for a in (x, delta, noise, x0) if a is not None]
+    rows, width = max(a.shape[0] for a in operands), x.shape[1]
+    for a in operands:
+        if a.shape[1] != width or rows % a.shape[0] or a.shape[0] % BLOCK_ROWS:
+            raise ValueError(f"operand {a.shape} must tile [{rows}, {width}] in blocks of {BLOCK_ROWS} rows")
+    row_spec = lambda a: pl.BlockSpec((BLOCK_ROWS, width), lambda i, n=a.shape[0] // BLOCK_ROWS: (i % n, 0))
+    in_specs = [row_spec(a) for a in operands]
+    if x0 is not None:
+        operands, in_specs = [scales] + operands, [pl.BlockSpec((2,), lambda i: (0,))] + in_specs
+    out_spec = pl.BlockSpec((BLOCK_ROWS, width), lambda i: (i, 0))
+    kernel = functools.partial(
+        _kernel, sigma=_bf16(sigma), has_delta=delta is not None, has_noise=noise is not None, has_x0=x0 is not None
+    )
+    return pl.pallas_call(
+        kernel,
+        grid=(rows // BLOCK_ROWS,),
+        in_specs=in_specs,
+        out_specs=[out_spec, out_spec],
+        out_shape=[jax.ShapeDtypeStruct((rows, width), jnp.float32), jax.ShapeDtypeStruct((rows, width), jnp.bfloat16)],
+        compiler_params=pltr.CompilerParams(num_warps=NUM_WARPS, num_stages=1),
+        name="residual_norm",
+    )(*operands)
+
+
+@functools.partial(jax.jit, static_argnames=("sigma",))
+def add_norm(x, delta, noise=None, sigma=0.0):
+    """x' = x + (delta + sigma noise) -> (x' fp32, norm(x') bf16). x fp32, delta / noise bf16 (noise optional), all
+    [rows_i, D] with rows_i dividing the output rows."""
+    return _call(x.astype(jnp.float32), delta, noise, None, None, sigma)
+
+
+@functools.partial(jax.jit, static_argnames=("sigma",))
+def add_mix_norm(x, delta, noise, x0, resid_lambda, x0_lambda, sigma=0.0):
+    """mixed = resid_lambda (x + delta + sigma noise) + x0_lambda x0 -> (mixed fp32, norm(mixed) bf16). delta and noise
+    may be None (no pending residual add); shapes as in add_norm."""
+    scales = jnp.stack([resid_lambda, x0_lambda]).astype(jnp.float32)
+    return _call(x.astype(jnp.float32), delta, noise, x0.astype(jnp.float32), scales, sigma)
+
+
+def _rows(a, rows):
+    return jnp.tile(a, (rows // a.shape[0], 1))
+
+
+def reference_add_norm(x, delta, noise=None, sigma=0.0):
+    """The trainer's jnp path: bf16 jitter add, fp32 residual add, RMS norm to bf16."""
+    rows = max(a.shape[0] for a in (x, delta, noise) if a is not None)
+    delta = _rows(delta, rows)
+    if noise is not None:
+        delta = delta + (sigma * _rows(noise, rows)).astype(delta.dtype)
+    x = _rows(x, rows) + delta.astype(jnp.float32)
+    return x, (x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + EPS)).astype(jnp.bfloat16)
+
+
+def reference_add_mix_norm(x, delta, noise, x0, resid_lambda, x0_lambda, sigma=0.0):
+    rows = max(a.shape[0] for a in (x, delta, noise, x0) if a is not None)
+    x = _rows(x, rows)
+    if delta is not None:
+        x, _ = reference_add_norm(x, delta, noise, sigma)
+    mixed = resid_lambda * x + x0_lambda * _rows(x0, rows)
+    return mixed, (mixed * jax.lax.rsqrt(jnp.mean(mixed * mixed, axis=-1, keepdims=True) + EPS)).astype(jnp.bfloat16)
+
+====================================================================================================
+# kernels/rope_norm.py
+"""RoPE + per-head RMS norm of q/k in one pass, bf16 out (Pallas Triton).
+
+XLA computes the rotation as an fp32 concatenate (written to HBM), then normalizes it in a second kernel. Here each
+program loads a block of head rows once, takes the RMS statistic (RoPE rotates channel pairs, so it keeps the RMS),
+rotates both halves and stores bf16: one read of the input, one bf16 write.
+"""
+
+import functools
+
+import jax
+import jax.numpy as jnp
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import triton as pltr
+
+EPS = 1e-6
+
+
+def reference(x, cos, sin):
+    """The trainer's process_qk: x [B, T, H, D]; cos, sin [1, T, 1, D/2] -> bf16 [B, T, H, D]."""
+    x = x.astype(jnp.float32)
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    rotated = jnp.concatenate([x1 * cos + x2 * sin, x1 * -sin + x2 * cos], axis=-1)
+    return (rotated * jax.lax.rsqrt(jnp.mean(rotated * rotated, axis=-1, keepdims=True) + EPS)).astype(jnp.bfloat16)
+
+
+def _kernel(x_ref, cos_ref, sin_ref, out_ref, *, half):
+    x1 = x_ref[:, pl.ds(0, half)].astype(jnp.float32)
+    x2 = x_ref[:, pl.ds(half, half)].astype(jnp.float32)
+    scale = jax.lax.rsqrt(((x1 * x1).sum(axis=1) + (x2 * x2).sum(axis=1)) / (2 * half) + EPS)[:, None]
+    cos, sin = cos_ref[...], sin_ref[...]
+    out_ref[:, pl.ds(0, half)] = ((x1 * cos + x2 * sin) * scale).astype(out_ref.dtype)
+    out_ref[:, pl.ds(half, half)] = ((x2 * cos - x1 * sin) * scale).astype(out_ref.dtype)
+
+
+@functools.partial(jax.jit, static_argnames=("block_rows", "num_warps"))
+def rope_norm(x, cos, sin, block_rows=64, num_warps=8):
+    """x [B, T, H, D] (bf16 or fp32); cos, sin [1, T, 1, D/2] fp32 -> bf16 [B, T, H, D]. Default tiling: the fastest
+    on H100 for [128, 2048, 8, 64] (from a tiling sweep)."""
+    b, t, h, d = x.shape
+    half = d // 2
+    period = t * h  # head rows per sequence; the rotation angle depends on the row's position t
+    if period % block_rows:
+        raise ValueError(f"T * H = {period} must divide by {block_rows}")
+    # one (cos, sin) row per head row of a sequence: row r of x has position (r // H) % T
+    cos_rows = jnp.repeat(cos.reshape(t, half), h, axis=0).astype(jnp.float32)
+    sin_rows = jnp.repeat(sin.reshape(t, half), h, axis=0).astype(jnp.float32)
+    blocks_per_sequence = period // block_rows
+    angle_spec = pl.BlockSpec((block_rows, half), lambda i: (i % blocks_per_sequence, 0))
+    out = pl.pallas_call(
+        functools.partial(_kernel, half=half),
+        grid=(b * period // block_rows,),
+        in_specs=[pl.BlockSpec((block_rows, d), lambda i: (i, 0)), angle_spec, angle_spec],
+        out_specs=pl.BlockSpec((block_rows, d), lambda i: (i, 0)),
+        out_shape=jax.ShapeDtypeStruct((b * period, d), jnp.bfloat16),
+        compiler_params=pltr.CompilerParams(num_warps=num_warps, num_stages=1),
+        name="rope_norm",
+    )(x.reshape(b * period, d), cos_rows, sin_rows)
+    return out.reshape(b, t, h, d)
+
+====================================================================================================
+Tue Oct 20 12:34:26 2026       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 580.126.20             Driver Version: 580.126.20     CUDA Version: 13.0     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA H100 80GB HBM3          On  |   00000000:04:00.0 Off |                    0 |
+| N/A   41C    P0             72W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA H100 80GB HBM3          On  |   00000000:05:00.0 Off |                    0 |
+| N/A   37C    P0             72W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   2  NVIDIA H100 80GB HBM3          On  |   00000000:0A:00.0 Off |                    0 |
+| N/A   42C    P0             75W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   3  NVIDIA H100 80GB HBM3          On  |   00000000:0B:00.0 Off |                    0 |
+| N/A   37C    P0             71W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   4  NVIDIA H100 80GB HBM3          On  |   00000000:84:00.0 Off |                    0 |
+| N/A   41C    P0             68W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   5  NVIDIA H100 80GB HBM3          On  |   00000000:85:00.0 Off |                    0 |
+| N/A   36C    P0             70W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   6  NVIDIA H100 80GB HBM3          On  |   00000000:8A:00.0 Off |                    0 |
+| N/A   40C    P0             76W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+|   7  NVIDIA H100 80GB HBM3          On  |   00000000:8B:00.0 Off |                    0 |
+| N/A   38C    P0             74W /  700W |       4MiB /  81559MiB |      0%      Default |
+|                                         |                        |             Disabled |
++-----------------------------------------+------------------------+----------------------+
+
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+
+run 773bbcc8-4c9b-4de6-9b4a-7426c44db164 | jax 0.11.2 | 8x NVIDIA H100 80GB HBM3
+{"data": "/home/robert_sakana_ai/dust-repro/noise-jax-pr/logs/speedrun-147908/rows", "train_rows": 4880, "max_epochs": 1, "batch_size": 4, "seq_len": 2048, "seq_warmup": "1024:780", "num_iterations": 975, "val_every": 1000000, "target": 4.2, "save_every": 0, "save_steps": "975", "seed": 0, "rng": "rbg", "vocab_size": 4096, "n_layer": 8, "n_head": 8, "n_embd": 512, "lr": 0.003, "beta1": 0.7, "beta2": 0.98, "adam_eps": 1e-08, "lr_wte": 0.9, "lr_value_embeds": 0.9, "lr_lambdas": 0.003, "anvil_lr": 0.04, "anvil_wd": 2.25, "warmup_steps": 0, "cooldown_steps": 390}
+parameters: 37,749,776
+compiled in 23s
+step:0/975 val_loss:8.3183 tokens:0 train_time:0ms step_avg:0.00ms
+step:1/975 train_loss:8.3189 train_time:60ms step_avg:60.12ms
+step:2/975 train_loss:7.9310 train_time:87ms step_avg:43.48ms
+step:3/975 train_loss:7.4021 train_time:114ms step_avg:37.93ms
+step:4/975 train_loss:7.2235 train_time:137ms step_avg:34.18ms
+step:5/975 train_loss:7.1383 train_time:157ms step_avg:31.48ms
+step:6/975 train_loss:7.1184 train_time:181ms step_avg:30.21ms
+step:7/975 train_loss:7.1034 train_time:205ms step_avg:29.31ms
+step:8/975 train_loss:6.9283 train_time:229ms step_avg:28.60ms
+step:9/975 train_loss:6.7152 train_time:250ms step_avg:27.81ms
+step:10/975 train_loss:6.5612 train_time:271ms step_avg:27.06ms
+step:11/975 train_loss:6.4184 train_time:289ms step_avg:26.25ms
+step:12/975 train_loss:6.4077 train_time:303ms step_avg:25.28ms
+step:13/975 train_loss:6.4273 train_time:324ms step_avg:24.94ms
+step:14/975 train_loss:6.4117 train_time:343ms step_avg:24.48ms
+step:15/975 train_loss:6.2942 train_time:363ms step_avg:24.17ms
+step:16/975 train_loss:6.3080 train_time:387ms step_avg:24.21ms
+step:17/975 train_loss:6.3833 train_time:403ms step_avg:23.71ms
+step:18/975 train_loss:6.0605 train_time:429ms step_avg:23.81ms
+step:19/975 train_loss:6.1026 train_time:449ms step_avg:23.64ms
+step:20/975 train_loss:6.1023 train_time:469ms step_avg:23.46ms
+step:21/975 train_loss:6.2126 train_time:491ms step_avg:23.40ms
+step:22/975 train_loss:6.0231 train_time:512ms step_avg:23.29ms
+step:23/975 train_loss:5.8148 train_time:528ms step_avg:22.94ms
+step:24/975 train_loss:5.9511 train_time:546ms step_avg:22.75ms
+step:25/975 train_loss:5.7644 train_time:569ms step_avg:22.76ms
+step:26/975 train_loss:5.9128 train_time:588ms step_avg:22.63ms
+step:27/975 train_loss:6.0640 train_time:608ms step_avg:22.52ms
+step:28/975 train_loss:5.8721 train_time:627ms step_avg:22.39ms
+step:29/975 train_loss:5.7484 train_time:646ms step_avg:22.28ms
+step:30/975 train_loss:5.7920 train_time:662ms step_avg:22.07ms
+step:31/975 train_loss:5.8728 train_time:680ms step_avg:21.93ms
+step:32/975 train_loss:5.8816 train_time:696ms step_avg:21.74ms
+step:33/975 train_loss:5.7011 train_time:716ms step_avg:21.68ms
+step:34/975 train_loss:5.6732 train_time:736ms step_avg:21.63ms
+step:35/975 train_loss:5.7122 train_time:751ms step_avg:21.45ms
+step:36/975 train_loss:5.6754 train_time:767ms step_avg:21.30ms
+step:37/975 train_loss:5.6811 train_time:785ms step_avg:21.20ms
+step:38/975 train_loss:5.7729 train_time:804ms step_avg:21.15ms
+step:39/975 train_loss:5.6955 train_time:822ms step_avg:21.08ms
+step:40/975 train_loss:5.6625 train_time:836ms step_avg:20.89ms
+step:41/975 train_loss:5.6630 train_time:854ms step_avg:20.84ms
+step:42/975 train_loss:5.4986 train_time:869ms step_avg:20.70ms
+step:43/975 train_loss:5.5419 train_time:892ms step_avg:20.74ms
+step:44/975 train_loss:5.7005 train_time:905ms step_avg:20.56ms
+step:45/975 train_loss:5.5703 train_time:930ms step_avg:20.66ms
+step:46/975 train_loss:5.6278 train_time:956ms step_avg:20.77ms
+step:47/975 train_loss:5.6231 train_time:969ms step_avg:20.62ms
+step:48/975 train_loss:5.5553 train_time:989ms step_avg:20.61ms
+step:49/975 train_loss:5.5930 train_time:1010ms step_avg:20.61ms
+step:50/975 train_loss:5.5688 train_time:1026ms step_avg:20.52ms
+step:51/975 train_loss:5.4751 train_time:1041ms step_avg:20.40ms
+step:52/975 train_loss:5.5091 train_time:1059ms step_avg:20.37ms
+step:53/975 train_loss:5.5788 train_time:1074ms step_avg:20.26ms
+step:54/975 train_loss:5.6445 train_time:1095ms step_avg:20.28ms
+step:55/975 train_loss:5.4816 train_time:1109ms step_avg:20.17ms
+step:56/975 train_loss:5.6089 train_time:1127ms step_avg:20.12ms
+step:57/975 train_loss:5.5262 train_time:1145ms step_avg:20.09ms
+step:58/975 train_loss:5.6706 train_time:1158ms step_avg:19.97ms
+step:59/975 train_loss:5.5471 train_time:1174ms step_avg:19.89ms
+step:60/975 train_loss:5.4451 train_time:1193ms step_avg:19.88ms
+step:61/975 train_loss:5.5025 train_time:1208ms step_avg:19.80ms
+step:62/975 train_loss:5.4755 train_time:1221ms step_avg:19.69ms
+step:63/975 train_loss:5.4728 train_time:1237ms step_avg:19.63ms
+step:64/975 train_loss:5.4937 train_time:1250ms step_avg:19.54ms
+step:65/975 train_loss:5.4330 train_time:1270ms step_avg:19.54ms
+step:66/975 train_loss:5.4502 train_time:1291ms step_avg:19.56ms
+step:67/975 train_loss:5.4752 train_time:1304ms step_avg:19.47ms
+step:68/975 train_loss:5.4191 train_time:1317ms step_avg:19.37ms
+step:69/975 train_loss:5.4285 train_time:1330ms step_avg:19.28ms
+step:70/975 train_loss:5.4053 train_time:1347ms step_avg:19.24ms
+step:71/975 train_loss:5.3870 train_time:1360ms step_avg:19.16ms
+step:72/975 train_loss:5.2864 train_time:1378ms step_avg:19.13ms
+step:73/975 train_loss:5.4210 train_time:1392ms step_avg:19.06ms
+step:74/975 train_loss:5.3268 train_time:1408ms step_avg:19.03ms
+step:75/975 train_loss:5.5595 train_time:1426ms step_avg:19.02ms
+step:76/975 train_loss:5.4018 train_time:1443ms step_avg:18.98ms
+step:77/975 train_loss:5.3149 train_time:1456ms step_avg:18.91ms
+step:78/975 train_loss:5.3897 train_time:1474ms step_avg:18.90ms
+step:79/975 train_loss:5.4329 train_time:1488ms step_avg:18.83ms
+step:80/975 train_loss:5.3985 train_time:1501ms step_avg:18.76ms
+step:81/975 train_loss:5.2900 train_time:1516ms step_avg:18.72ms
+step:82/975 train_loss:5.3864 train_time:1535ms step_avg:18.72ms
+step:83/975 train_loss:5.2358 train_time:1548ms step_avg:18.65ms
+step:84/975 train_loss:5.3086 train_time:1561ms step_avg:18.58ms
+step:85/975 train_loss:5.2267 train_time:1574ms step_avg:18.51ms
+step:86/975 train_loss:5.3406 train_time:1591ms step_avg:18.50ms
+step:87/975 train_loss:5.3259 train_time:1604ms step_avg:18.44ms
+step:88/975 train_loss:5.1583 train_time:1619ms step_avg:18.40ms
+step:89/975 train_loss:5.4316 train_time:1632ms step_avg:18.34ms
+step:90/975 train_loss:5.1640 train_time:1648ms step_avg:18.31ms
+step:91/975 train_loss:5.4921 train_time:1662ms step_avg:18.27ms
+step:92/975 train_loss:5.1767 train_time:1676ms step_avg:18.22ms
+step:93/975 train_loss:5.3043 train_time:1695ms step_avg:18.22ms
+step:94/975 train_loss:5.2600 train_time:1708ms step_avg:18.17ms
+step:95/975 train_loss:5.2921 train_time:1722ms step_avg:18.12ms
+step:96/975 train_loss:5.1148 train_time:1737ms step_avg:18.10ms
+step:97/975 train_loss:5.3429 train_time:1751ms step_avg:18.05ms
+step:98/975 train_loss:5.4011 train_time:1765ms step_avg:18.01ms
+step:99/975 train_loss:5.2747 train_time:1779ms step_avg:17.97ms
+step:100/975 train_loss:5.2585 train_time:1795ms step_avg:17.95ms
+step:101/975 train_loss:5.3017 train_time:1811ms step_avg:17.93ms
+step:102/975 train_loss:5.2777 train_time:1825ms step_avg:17.89ms
+step:103/975 train_loss:5.2708 train_time:1839ms step_avg:17.85ms
+step:104/975 train_loss:5.2514 train_time:1861ms step_avg:17.89ms
+step:105/975 train_loss:5.2429 train_time:1902ms step_avg:18.11ms
+step:106/975 train_loss:5.3571 train_time:1923ms step_avg:18.14ms
+step:107/975 train_loss:5.1595 train_time:1938ms step_avg:18.11ms
+step:108/975 train_loss:5.3432 train_time:1953ms step_avg:18.09ms
+step:109/975 train_loss:5.2514 train_time:1967ms step_avg:18.05ms
+step:110/975 train_loss:5.1452 train_time:1986ms step_avg:18.05ms
+step:111/975 train_loss:5.2420 train_time:2000ms step_avg:18.02ms
+step:112/975 train_loss:5.1832 train_time:2013ms step_avg:17.97ms
+step:113/975 train_loss:5.1974 train_time:2026ms step_avg:17.93ms
+step:114/975 train_loss:5.1288 train_time:2039ms step_avg:17.89ms
+step:115/975 train_loss:5.0824 train_time:2054ms step_avg:17.86ms
+step:116/975 train_loss:5.2482 train_time:2068ms step_avg:17.83ms
+step:117/975 train_loss:5.2558 train_time:2085ms step_avg:17.82ms
+step:118/975 train_loss:5.3714 train_time:2099ms step_avg:17.79ms
+step:119/975 train_loss:5.2573 train_time:2115ms step_avg:17.78ms
+step:120/975 train_loss:5.1663 train_time:2131ms step_avg:17.76ms
+step:121/975 train_loss:5.2718 train_time:2143ms step_avg:17.71ms
+step:122/975 train_loss:5.0422 train_time:2158ms step_avg:17.69ms
+step:123/975 train_loss:5.4742 train_time:2172ms step_avg:17.66ms
+step:124/975 train_loss:5.1829 train_time:2185ms step_avg:17.62ms
+step:125/975 train_loss:5.1599 train_time:2201ms step_avg:17.61ms
+step:126/975 train_loss:5.0095 train_time:2215ms step_avg:17.58ms
+step:127/975 train_loss:5.1700 train_time:2230ms step_avg:17.56ms
+step:128/975 train_loss:5.1485 train_time:2246ms step_avg:17.55ms
+step:129/975 train_loss:5.2314 train_time:2259ms step_avg:17.51ms
+step:130/975 train_loss:5.0942 train_time:2275ms step_avg:17.50ms
+step:131/975 train_loss:5.0145 train_time:2292ms step_avg:17.50ms
+step:132/975 train_loss:5.1816 train_time:2305ms step_avg:17.46ms
+step:133/975 train_loss:5.1580 train_time:2318ms step_avg:17.43ms
+step:134/975 train_loss:5.1547 train_time:2333ms step_avg:17.41ms
+step:135/975 train_loss:5.1239 train_time:2347ms step_avg:17.39ms
+step:136/975 train_loss:5.3162 train_time:2362ms step_avg:17.37ms
+step:137/975 train_loss:5.0716 train_time:2377ms step_avg:17.35ms
+step:138/975 train_loss:5.0216 train_time:2392ms step_avg:17.33ms
+step:139/975 train_loss:5.1310 train_time:2407ms step_avg:17.32ms
+step:140/975 train_loss:4.9380 train_time:2422ms step_avg:17.30ms
+step:141/975 train_loss:5.0027 train_time:2437ms step_avg:17.28ms
+step:142/975 train_loss:4.8860 train_time:2451ms step_avg:17.26ms
+step:143/975 train_loss:5.0046 train_time:2466ms step_avg:17.24ms
+step:144/975 train_loss:5.2204 train_time:2486ms step_avg:17.26ms
+step:145/975 train_loss:5.0545 train_time:2499ms step_avg:17.23ms
+step:146/975 train_loss:5.0456 train_time:2513ms step_avg:17.21ms
+step:147/975 train_loss:5.0022 train_time:2527ms step_avg:17.19ms
+step:148/975 train_loss:5.0888 train_time:2540ms step_avg:17.16ms
+step:149/975 train_loss:5.1277 train_time:2554ms step_avg:17.14ms
+step:150/975 train_loss:5.0146 train_time:2574ms step_avg:17.16ms
+step:151/975 train_loss:5.0927 train_time:2588ms step_avg:17.14ms
+step:152/975 train_loss:5.0626 train_time:2601ms step_avg:17.11ms
+step:153/975 train_loss:5.0722 train_time:2615ms step_avg:17.09ms
+step:154/975 train_loss:5.0204 train_time:2628ms step_avg:17.06ms
+step:155/975 train_loss:4.9811 train_time:2643ms step_avg:17.05ms
+step:156/975 train_loss:4.9432 train_time:2658ms step_avg:17.04ms
+step:157/975 train_loss:4.9998 train_time:2672ms step_avg:17.02ms
+step:158/975 train_loss:5.3119 train_time:2691ms step_avg:17.03ms
+step:159/975 train_loss:5.0288 train_time:2704ms step_avg:17.01ms
+step:160/975 train_loss:5.0837 train_time:2718ms step_avg:16.99ms
+step:161/975 train_loss:4.8836 train_time:2732ms step_avg:16.97ms
+step:162/975 train_loss:5.0118 train_time:2745ms step_avg:16.95ms
+step:163/975 train_loss:5.2245 train_time:2760ms step_avg:16.93ms
+step:164/975 train_loss:5.0061 train_time:2775ms step_avg:16.92ms
+step:165/975 train_loss:5.3207 train_time:2790ms step_avg:16.91ms
+step:166/975 train_loss:4.9635 train_time:2808ms step_avg:16.91ms
+step:167/975 train_loss:4.8770 train_time:2821ms step_avg:16.89ms
+step:168/975 train_loss:5.1525 train_time:2834ms step_avg:16.87ms
+step:169/975 train_loss:5.0445 train_time:2849ms step_avg:16.86ms
+step:170/975 train_loss:4.9880 train_time:2866ms step_avg:16.86ms
+step:171/975 train_loss:4.8673 train_time:2879ms step_avg:16.84ms
+step:172/975 train_loss:5.1183 train_time:2893ms step_avg:16.82ms
+step:173/975 train_loss:4.9599 train_time:2907ms step_avg:16.81ms
+step:174/975 train_loss:5.0106 train_time:2922ms step_avg:16.79ms
+step:175/975 train_loss:5.0304 train_time:2937ms step_avg:16.78ms
+step:176/975 train_loss:4.9683 train_time:2952ms step_avg:16.77ms
+step:177/975 train_loss:4.9634 train_time:2967ms step_avg:16.76ms
+step:178/975 train_loss:5.2014 train_time:2981ms step_avg:16.75ms
+step:179/975 train_loss:4.9798 train_time:2996ms step_avg:16.74ms
+step:180/975 train_loss:4.9934 train_time:3010ms step_avg:16.72ms
+step:181/975 train_loss:5.0252 train_time:3025ms step_avg:16.71ms
+step:182/975 train_loss:5.0436 train_time:3040ms step_avg:16.71ms
+step:183/975 train_loss:4.9754 train_time:3055ms step_avg:16.69ms
+step:184/975 train_loss:5.0081 train_time:3069ms step_avg:16.68ms
+step:185/975 train_loss:4.8993 train_time:3084ms step_avg:16.67ms
+step:186/975 train_loss:5.0418 train_time:3101ms step_avg:16.67ms
+step:187/975 train_loss:4.9950 train_time:3114ms step_avg:16.65ms
+step:188/975 train_loss:5.0000 train_time:3130ms step_avg:16.65ms
+step:189/975 train_loss:4.9028 train_time:3143ms step_avg:16.63ms
+step:190/975 train_loss:4.9021 train_time:3160ms step_avg:16.63ms
+step:191/975 train_loss:5.0178 train_time:3173ms step_avg:16.61ms
+step:192/975 train_loss:4.8717 train_time:3187ms step_avg:16.60ms
+step:193/975 train_loss:4.9694 train_time:3203ms step_avg:16.59ms
+step:194/975 train_loss:4.9035 train_time:3217ms step_avg:16.58ms
+step:195/975 train_loss:4.9970 train_time:3231ms step_avg:16.57ms
+step:196/975 train_loss:4.9635 train_time:3246ms step_avg:16.56ms
+step:197/975 train_loss:4.7921 train_time:3261ms step_avg:16.55ms
+step:198/975 train_loss:4.8889 train_time:3276ms step_avg:16.54ms
+step:199/975 train_loss:4.9894 train_time:3291ms step_avg:16.54ms
+step:200/975 train_loss:4.9427 train_time:3305ms step_avg:16.53ms
+step:201/975 train_loss:4.8520 train_time:3319ms step_avg:16.51ms
+step:202/975 train_loss:4.9383 train_time:3335ms step_avg:16.51ms
+step:203/975 train_loss:4.8803 train_time:3349ms step_avg:16.50ms
+step:204/975 train_loss:4.8964 train_time:3364ms step_avg:16.49ms
+step:205/975 train_loss:4.7538 train_time:3379ms step_avg:16.48ms
+step:206/975 train_loss:5.0844 train_time:3394ms step_avg:16.48ms
+step:207/975 train_loss:4.7622 train_time:3408ms step_avg:16.46ms
+step:208/975 train_loss:4.7094 train_time:3423ms step_avg:16.46ms
+step:209/975 train_loss:4.9432 train_time:3438ms step_avg:16.45ms
+step:210/975 train_loss:4.9956 train_time:3452ms step_avg:16.44ms
+step:211/975 train_loss:4.8927 train_time:3467ms step_avg:16.43ms
+step:212/975 train_loss:4.9462 train_time:3481ms step_avg:16.42ms
+step:213/975 train_loss:4.8231 train_time:3497ms step_avg:16.42ms
+step:214/975 train_loss:4.9810 train_time:3512ms step_avg:16.41ms
+step:215/975 train_loss:4.9383 train_time:3526ms step_avg:16.40ms
+step:216/975 train_loss:4.9692 train_time:3540ms step_avg:16.39ms
+step:217/975 train_loss:4.9103 train_time:3556ms step_avg:16.39ms
+step:218/975 train_loss:4.8265 train_time:3569ms step_avg:16.37ms
+step:219/975 train_loss:4.7856 train_time:3585ms step_avg:16.37ms
+step:220/975 train_loss:4.9114 train_time:3600ms step_avg:16.36ms
+step:221/975 train_loss:4.9476 train_time:3614ms step_avg:16.35ms
+step:222/975 train_loss:5.0772 train_time:3629ms step_avg:16.35ms
+step:223/975 train_loss:5.0601 train_time:3643ms step_avg:16.34ms
+step:224/975 train_loss:4.8284 train_time:3659ms step_avg:16.34ms
+step:225/975 train_loss:4.8205 train_time:3673ms step_avg:16.33ms
+step:226/975 train_loss:4.9103 train_time:3688ms step_avg:16.32ms
+step:227/975 train_loss:4.8015 train_time:3702ms step_avg:16.31ms
+step:228/975 train_loss:4.8957 train_time:3718ms step_avg:16.31ms
+step:229/975 train_loss:4.8856 train_time:3733ms step_avg:16.30ms
+step:230/975 train_loss:4.9375 train_time:3746ms step_avg:16.29ms
+step:231/975 train_loss:4.8017 train_time:3761ms step_avg:16.28ms
+step:232/975 train_loss:4.9465 train_time:3779ms step_avg:16.29ms
+step:233/975 train_loss:4.8233 train_time:3792ms step_avg:16.28ms
+step:234/975 train_loss:4.7622 train_time:3805ms step_avg:16.26ms
+step:235/975 train_loss:4.9842 train_time:3825ms step_avg:16.27ms
+step:236/975 train_loss:4.9146 train_time:3838ms step_avg:16.26ms
+step:237/975 train_loss:4.9226 train_time:3852ms step_avg:16.25ms
+step:238/975 train_loss:4.8259 train_time:3868ms step_avg:16.25ms
+step:239/975 train_loss:4.7299 train_time:3880ms step_avg:16.24ms
+step:240/975 train_loss:4.8919 train_time:3894ms step_avg:16.23ms
+step:241/975 train_loss:4.8975 train_time:3908ms step_avg:16.22ms
+step:242/975 train_loss:4.7467 train_time:3923ms step_avg:16.21ms
+step:243/975 train_loss:4.8867 train_time:3941ms step_avg:16.22ms
+step:244/975 train_loss:4.9641 train_time:3954ms step_avg:16.21ms
+step:245/975 train_loss:4.8678 train_time:3967ms step_avg:16.19ms
+step:246/975 train_loss:4.9110 train_time:3982ms step_avg:16.19ms
+step:247/975 train_loss:4.9828 train_time:3997ms step_avg:16.18ms
+step:248/975 train_loss:5.1592 train_time:4015ms step_avg:16.19ms
+step:249/975 train_loss:4.8162 train_time:4029ms step_avg:16.18ms
+step:250/975 train_loss:4.8124 train_time:4042ms step_avg:16.17ms
+step:251/975 train_loss:4.8273 train_time:4056ms step_avg:16.16ms
+step:252/975 train_loss:4.7926 train_time:4072ms step_avg:16.16ms
+step:253/975 train_loss:4.9126 train_time:4086ms step_avg:16.15ms
+step:254/975 train_loss:4.8396 train_time:4100ms step_avg:16.14ms
+step:255/975 train_loss:4.8889 train_time:4115ms step_avg:16.14ms
+step:256/975 train_loss:4.7679 train_time:4130ms step_avg:16.13ms
+step:257/975 train_loss:4.7108 train_time:4144ms step_avg:16.12ms
+step:258/975 train_loss:4.8787 train_time:4159ms step_avg:16.12ms
+step:259/975 train_loss:4.9238 train_time:4174ms step_avg:16.12ms
+step:260/975 train_loss:4.7678 train_time:4189ms step_avg:16.11ms
+step:261/975 train_loss:4.7113 train_time:4202ms step_avg:16.10ms
+step:262/975 train_loss:4.7789 train_time:4218ms step_avg:16.10ms
+step:263/975 train_loss:5.0753 train_time:4235ms step_avg:16.10ms
+step:264/975 train_loss:4.8818 train_time:4249ms step_avg:16.09ms
+step:265/975 train_loss:4.9158 train_time:4263ms step_avg:16.09ms
+step:266/975 train_loss:4.8194 train_time:4277ms step_avg:16.08ms
+step:267/975 train_loss:4.8393 train_time:4291ms step_avg:16.07ms
+step:268/975 train_loss:4.6836 train_time:4306ms step_avg:16.07ms
+step:269/975 train_loss:5.0070 train_time:4321ms step_avg:16.06ms
+step:270/975 train_loss:4.7817 train_time:4336ms step_avg:16.06ms
+step:271/975 train_loss:4.6490 train_time:4350ms step_avg:16.05ms
+step:272/975 train_loss:4.7588 train_time:4365ms step_avg:16.05ms
+step:273/975 train_loss:4.7872 train_time:4380ms step_avg:16.05ms
+step:274/975 train_loss:4.8480 train_time:4395ms step_avg:16.04ms
+step:275/975 train_loss:4.8636 train_time:4412ms step_avg:16.04ms
+step:276/975 train_loss:4.9334 train_time:4425ms step_avg:16.03ms
+step:277/975 train_loss:4.9047 train_time:4439ms step_avg:16.03ms
+step:278/975 train_loss:4.8853 train_time:4454ms step_avg:16.02ms
+step:279/975 train_loss:4.7009 train_time:4469ms step_avg:16.02ms
+step:280/975 train_loss:4.8713 train_time:4483ms step_avg:16.01ms
+step:281/975 train_loss:4.6815 train_time:4498ms step_avg:16.01ms
+step:282/975 train_loss:4.9035 train_time:4512ms step_avg:16.00ms
+step:283/975 train_loss:4.8189 train_time:4526ms step_avg:15.99ms
+step:284/975 train_loss:4.6793 train_time:4541ms step_avg:15.99ms
+step:285/975 train_loss:4.7627 train_time:4556ms step_avg:15.99ms
+step:286/975 train_loss:4.7916 train_time:4572ms step_avg:15.99ms
+step:287/975 train_loss:4.8573 train_time:4585ms step_avg:15.98ms
+step:288/975 train_loss:4.8081 train_time:4601ms step_avg:15.97ms
+step:289/975 train_loss:4.7727 train_time:4616ms step_avg:15.97ms
+step:290/975 train_loss:4.8465 train_time:4630ms step_avg:15.97ms
+step:291/975 train_loss:4.8460 train_time:4645ms step_avg:15.96ms
+step:292/975 train_loss:4.7716 train_time:4660ms step_avg:15.96ms
+step:293/975 train_loss:4.6934 train_time:4675ms step_avg:15.95ms
+step:294/975 train_loss:4.6558 train_time:4689ms step_avg:15.95ms
+step:295/975 train_loss:4.8005 train_time:4704ms step_avg:15.94ms
+step:296/975 train_loss:4.7010 train_time:4719ms step_avg:15.94ms
+step:297/975 train_loss:4.6868 train_time:4734ms step_avg:15.94ms
+step:298/975 train_loss:4.9610 train_time:4747ms step_avg:15.93ms
+step:299/975 train_loss:4.9766 train_time:4763ms step_avg:15.93ms
+step:300/975 train_loss:4.6006 train_time:4778ms step_avg:15.93ms
+step:301/975 train_loss:4.6650 train_time:4791ms step_avg:15.92ms
+step:302/975 train_loss:4.8245 train_time:4807ms step_avg:15.92ms
+step:303/975 train_loss:4.9850 train_time:4821ms step_avg:15.91ms
+step:304/975 train_loss:4.7924 train_time:4837ms step_avg:15.91ms
+step:305/975 train_loss:4.7406 train_time:4851ms step_avg:15.91ms
+step:306/975 train_loss:4.8263 train_time:4868ms step_avg:15.91ms
+step:307/975 train_loss:4.7388 train_time:4881ms step_avg:15.90ms
+step:308/975 train_loss:4.9183 train_time:4896ms step_avg:15.89ms
+step:309/975 train_loss:4.9669 train_time:4912ms step_avg:15.90ms
+step:310/975 train_loss:4.6027 train_time:4925ms step_avg:15.89ms
+step:311/975 train_loss:4.7718 train_time:4939ms step_avg:15.88ms
+step:312/975 train_loss:4.7595 train_time:4954ms step_avg:15.88ms
+step:313/975 train_loss:4.9950 train_time:4968ms step_avg:15.87ms
+step:314/975 train_loss:4.8246 train_time:4983ms step_avg:15.87ms
+step:315/975 train_loss:4.7188 train_time:4999ms step_avg:15.87ms
+step:316/975 train_loss:4.7863 train_time:5013ms step_avg:15.86ms
+step:317/975 train_loss:4.6289 train_time:5027ms step_avg:15.86ms
+step:318/975 train_loss:4.7449 train_time:5044ms step_avg:15.86ms
+step:319/975 train_loss:4.7659 train_time:5057ms step_avg:15.85ms
+step:320/975 train_loss:4.5729 train_time:5072ms step_avg:15.85ms
+step:321/975 train_loss:4.7218 train_time:5087ms step_avg:15.85ms
+step:322/975 train_loss:4.7154 train_time:5101ms step_avg:15.84ms
+step:323/975 train_loss:4.8200 train_time:5117ms step_avg:15.84ms
+step:324/975 train_loss:4.6586 train_time:5131ms step_avg:15.84ms
+step:325/975 train_loss:4.7154 train_time:5146ms step_avg:15.83ms
+step:326/975 train_loss:4.6727 train_time:5160ms step_avg:15.83ms
+step:327/975 train_loss:4.7443 train_time:5175ms step_avg:15.83ms
+step:328/975 train_loss:4.7977 train_time:5189ms step_avg:15.82ms
+step:329/975 train_loss:4.7333 train_time:5207ms step_avg:15.83ms
+step:330/975 train_loss:4.7093 train_time:5221ms step_avg:15.82ms
+step:331/975 train_loss:4.9110 train_time:5235ms step_avg:15.81ms
+step:332/975 train_loss:4.7906 train_time:5248ms step_avg:15.81ms
+step:333/975 train_loss:4.7330 train_time:5263ms step_avg:15.80ms
+step:334/975 train_loss:4.8928 train_time:5279ms step_avg:15.80ms
+step:335/975 train_loss:4.6390 train_time:5293ms step_avg:15.80ms
+step:336/975 train_loss:4.6428 train_time:5308ms step_avg:15.80ms
+step:337/975 train_loss:4.7479 train_time:5322ms step_avg:15.79ms
+step:338/975 train_loss:4.6149 train_time:5338ms step_avg:15.79ms
+step:339/975 train_loss:4.6715 train_time:5352ms step_avg:15.79ms
+step:340/975 train_loss:4.7473 train_time:5366ms step_avg:15.78ms
+step:341/975 train_loss:4.7328 train_time:5381ms step_avg:15.78ms
+step:342/975 train_loss:4.6883 train_time:5397ms step_avg:15.78ms
+step:343/975 train_loss:4.6408 train_time:5411ms step_avg:15.77ms
+step:344/975 train_loss:4.7157 train_time:5425ms step_avg:15.77ms
+step:345/975 train_loss:4.8377 train_time:5440ms step_avg:15.77ms
+step:346/975 train_loss:4.6620 train_time:5455ms step_avg:15.76ms
+step:347/975 train_loss:4.7771 train_time:5470ms step_avg:15.76ms
+step:348/975 train_loss:4.7451 train_time:5484ms step_avg:15.76ms
+step:349/975 train_loss:4.7185 train_time:5499ms step_avg:15.76ms
+step:350/975 train_loss:4.7969 train_time:5514ms step_avg:15.75ms
+step:351/975 train_loss:4.7502 train_time:5528ms step_avg:15.75ms
+step:352/975 train_loss:4.6892 train_time:5543ms step_avg:15.75ms
+step:353/975 train_loss:4.8302 train_time:5557ms step_avg:15.74ms
+step:354/975 train_loss:4.7930 train_time:5573ms step_avg:15.74ms
+step:355/975 train_loss:4.8349 train_time:5587ms step_avg:15.74ms
+step:356/975 train_loss:4.6955 train_time:5602ms step_avg:15.74ms
+step:357/975 train_loss:4.8878 train_time:5617ms step_avg:15.73ms
+step:358/975 train_loss:4.7381 train_time:5632ms step_avg:15.73ms
+step:359/975 train_loss:4.9098 train_time:5646ms step_avg:15.73ms
+step:360/975 train_loss:4.6859 train_time:5660ms step_avg:15.72ms
+step:361/975 train_loss:4.8173 train_time:5676ms step_avg:15.72ms
+step:362/975 train_loss:4.7824 train_time:5691ms step_avg:15.72ms
+step:363/975 train_loss:4.7229 train_time:5705ms step_avg:15.72ms
+step:364/975 train_loss:4.8454 train_time:5719ms step_avg:15.71ms
+step:365/975 train_loss:4.7689 train_time:5735ms step_avg:15.71ms
+step:366/975 train_loss:4.6824 train_time:5749ms step_avg:15.71ms
+step:367/975 train_loss:4.5097 train_time:5763ms step_avg:15.70ms
+step:368/975 train_loss:4.6324 train_time:5779ms step_avg:15.70ms
+step:369/975 train_loss:4.7377 train_time:5794ms step_avg:15.70ms
+step:370/975 train_loss:4.7567 train_time:5808ms step_avg:15.70ms
+step:371/975 train_loss:4.7007 train_time:5824ms step_avg:15.70ms
+step:372/975 train_loss:4.5343 train_time:5838ms step_avg:15.69ms
+step:373/975 train_loss:4.7567 train_time:5854ms step_avg:15.69ms
+step:374/975 train_loss:4.7074 train_time:5867ms step_avg:15.69ms
+step:375/975 train_loss:4.7762 train_time:5883ms step_avg:15.69ms
+step:376/975 train_loss:4.6401 train_time:5897ms step_avg:15.68ms
+step:377/975 train_loss:4.6136 train_time:5912ms step_avg:15.68ms
+step:378/975 train_loss:4.6805 train_time:5926ms step_avg:15.68ms
+step:379/975 train_loss:4.7807 train_time:5941ms step_avg:15.67ms
+step:380/975 train_loss:4.7235 train_time:5955ms step_avg:15.67ms
+step:381/975 train_loss:4.7242 train_time:5970ms step_avg:15.67ms
+step:382/975 train_loss:5.0419 train_time:5985ms step_avg:15.67ms
+step:383/975 train_loss:4.5811 train_time:5999ms step_avg:15.66ms
+step:384/975 train_loss:4.6576 train_time:6015ms step_avg:15.66ms
+step:385/975 train_loss:4.7103 train_time:6029ms step_avg:15.66ms
+step:386/975 train_loss:4.6638 train_time:6044ms step_avg:15.66ms
+step:387/975 train_loss:4.7832 train_time:6059ms step_avg:15.66ms
+step:388/975 train_loss:4.6832 train_time:6075ms step_avg:15.66ms
+step:389/975 train_loss:4.5215 train_time:6088ms step_avg:15.65ms
+step:390/975 train_loss:4.6387 train_time:6103ms step_avg:15.65ms
+step:391/975 train_loss:4.7304 train_time:6118ms step_avg:15.65ms
+step:392/975 train_loss:4.6541 train_time:6133ms step_avg:15.64ms
+step:393/975 train_loss:4.7084 train_time:6147ms step_avg:15.64ms
+step:394/975 train_loss:4.7966 train_time:6162ms step_avg:15.64ms
+step:395/975 train_loss:4.5567 train_time:6177ms step_avg:15.64ms
+step:396/975 train_loss:4.7503 train_time:6192ms step_avg:15.64ms
+step:397/975 train_loss:4.7401 train_time:6206ms step_avg:15.63ms
+step:398/975 train_loss:4.6705 train_time:6220ms step_avg:15.63ms
+step:399/975 train_loss:4.7762 train_time:6236ms step_avg:15.63ms
+step:400/975 train_loss:4.6072 train_time:6250ms step_avg:15.63ms
+step:401/975 train_loss:4.7105 train_time:6265ms step_avg:15.62ms
+step:402/975 train_loss:4.7067 train_time:6279ms step_avg:15.62ms
+step:403/975 train_loss:4.8362 train_time:6294ms step_avg:15.62ms
+step:404/975 train_loss:4.7000 train_time:6309ms step_avg:15.62ms
+step:405/975 train_loss:4.7508 train_time:6323ms step_avg:15.61ms
+step:406/975 train_loss:4.6909 train_time:6339ms step_avg:15.61ms
+step:407/975 train_loss:4.6351 train_time:6353ms step_avg:15.61ms
+step:408/975 train_loss:4.7154 train_time:6367ms step_avg:15.61ms
+step:409/975 train_loss:4.6278 train_time:6382ms step_avg:15.61ms
+step:410/975 train_loss:4.9135 train_time:6399ms step_avg:15.61ms
+step:411/975 train_loss:4.5893 train_time:6413ms step_avg:15.60ms
+step:412/975 train_loss:4.6658 train_time:6427ms step_avg:15.60ms
+step:413/975 train_loss:4.6420 train_time:6442ms step_avg:15.60ms
+step:414/975 train_loss:4.7689 train_time:6457ms step_avg:15.60ms
+step:415/975 train_loss:4.5269 train_time:6471ms step_avg:15.59ms
+step:416/975 train_loss:4.6046 train_time:6485ms step_avg:15.59ms
+step:417/975 train_loss:4.5411 train_time:6500ms step_avg:15.59ms
+step:418/975 train_loss:4.6519 train_time:6515ms step_avg:15.59ms
+step:419/975 train_loss:4.6121 train_time:6529ms step_avg:15.58ms
+step:420/975 train_loss:4.5596 train_time:6544ms step_avg:15.58ms
+step:421/975 train_loss:4.7459 train_time:6560ms step_avg:15.58ms
+step:422/975 train_loss:4.6873 train_time:6576ms step_avg:15.58ms
+step:423/975 train_loss:4.7214 train_time:6589ms step_avg:15.58ms
+step:424/975 train_loss:4.5996 train_time:6604ms step_avg:15.57ms
+step:425/975 train_loss:4.4942 train_time:6619ms step_avg:15.57ms
+step:426/975 train_loss:4.6382 train_time:6633ms step_avg:15.57ms
+step:427/975 train_loss:4.6765 train_time:6647ms step_avg:15.57ms
+step:428/975 train_loss:4.4871 train_time:6662ms step_avg:15.57ms
+step:429/975 train_loss:4.5957 train_time:6677ms step_avg:15.56ms
+step:430/975 train_loss:4.5158 train_time:6692ms step_avg:15.56ms
+step:431/975 train_loss:4.5010 train_time:6706ms step_avg:15.56ms
+step:432/975 train_loss:4.8468 train_time:6721ms step_avg:15.56ms
+step:433/975 train_loss:4.6467 train_time:6737ms step_avg:15.56ms
+step:434/975 train_loss:4.4449 train_time:6752ms step_avg:15.56ms
+step:435/975 train_loss:4.7994 train_time:6766ms step_avg:15.55ms
+step:436/975 train_loss:4.6629 train_time:6781ms step_avg:15.55ms
+step:437/975 train_loss:4.7056 train_time:6796ms step_avg:15.55ms
+step:438/975 train_loss:4.6940 train_time:6809ms step_avg:15.55ms
+step:439/975 train_loss:4.6930 train_time:6824ms step_avg:15.54ms
+step:440/975 train_loss:4.5597 train_time:6839ms step_avg:15.54ms
+step:441/975 train_loss:4.4762 train_time:6854ms step_avg:15.54ms
+step:442/975 train_loss:4.7086 train_time:6869ms step_avg:15.54ms
+step:443/975 train_loss:4.7234 train_time:6883ms step_avg:15.54ms
+step:444/975 train_loss:4.5522 train_time:6899ms step_avg:15.54ms
+step:445/975 train_loss:4.6967 train_time:6913ms step_avg:15.53ms
+step:446/975 train_loss:4.5141 train_time:6927ms step_avg:15.53ms
+step:447/975 train_loss:4.5945 train_time:6942ms step_avg:15.53ms
+step:448/975 train_loss:4.6327 train_time:6957ms step_avg:15.53ms
+step:449/975 train_loss:4.4970 train_time:6972ms step_avg:15.53ms
+step:450/975 train_loss:4.5934 train_time:6986ms step_avg:15.53ms
+step:451/975 train_loss:4.8222 train_time:7001ms step_avg:15.52ms
+step:452/975 train_loss:4.4697 train_time:7016ms step_avg:15.52ms
+step:453/975 train_loss:4.7114 train_time:7031ms step_avg:15.52ms
+step:454/975 train_loss:4.6326 train_time:7045ms step_avg:15.52ms
+step:455/975 train_loss:4.6701 train_time:7060ms step_avg:15.52ms
+step:456/975 train_loss:4.7678 train_time:7075ms step_avg:15.52ms
+step:457/975 train_loss:4.7118 train_time:7090ms step_avg:15.51ms
+step:458/975 train_loss:4.5471 train_time:7105ms step_avg:15.51ms
+step:459/975 train_loss:4.4803 train_time:7119ms step_avg:15.51ms
+step:460/975 train_loss:4.5437 train_time:7134ms step_avg:15.51ms
+step:461/975 train_loss:4.7707 train_time:7148ms step_avg:15.51ms
+step:462/975 train_loss:4.6920 train_time:7163ms step_avg:15.50ms
+step:463/975 train_loss:4.6485 train_time:7178ms step_avg:15.50ms
+step:464/975 train_loss:4.5992 train_time:7194ms step_avg:15.50ms
+step:465/975 train_loss:4.6885 train_time:7207ms step_avg:15.50ms
+step:466/975 train_loss:4.6932 train_time:7222ms step_avg:15.50ms
+step:467/975 train_loss:4.5636 train_time:7236ms step_avg:15.50ms
+step:468/975 train_loss:4.7176 train_time:7252ms step_avg:15.50ms
+step:469/975 train_loss:4.5506 train_time:7266ms step_avg:15.49ms
+step:470/975 train_loss:4.7134 train_time:7282ms step_avg:15.49ms
+step:471/975 train_loss:4.6723 train_time:7297ms step_avg:15.49ms
+step:472/975 train_loss:4.7403 train_time:7310ms step_avg:15.49ms
+step:473/975 train_loss:4.5348 train_time:7325ms step_avg:15.49ms
+step:474/975 train_loss:4.8332 train_time:7340ms step_avg:15.48ms
+step:475/975 train_loss:4.5377 train_time:7355ms step_avg:15.49ms
+step:476/975 train_loss:4.5311 train_time:7369ms step_avg:15.48ms
+step:477/975 train_loss:4.5056 train_time:7384ms step_avg:15.48ms
+step:478/975 train_loss:4.6583 train_time:7399ms step_avg:15.48ms
+step:479/975 train_loss:4.5874 train_time:7414ms step_avg:15.48ms
+step:480/975 train_loss:4.7026 train_time:7428ms step_avg:15.47ms
+step:481/975 train_loss:4.6998 train_time:7443ms step_avg:15.47ms
+step:482/975 train_loss:4.6027 train_time:7457ms step_avg:15.47ms
+step:483/975 train_loss:4.6447 train_time:7475ms step_avg:15.48ms
+step:484/975 train_loss:4.5292 train_time:7488ms step_avg:15.47ms
+step:485/975 train_loss:4.4903 train_time:7502ms step_avg:15.47ms
+step:486/975 train_loss:4.5571 train_time:7517ms step_avg:15.47ms
+step:487/975 train_loss:4.6025 train_time:7532ms step_avg:15.47ms
+step:488/975 train_loss:4.5609 train_time:7544ms step_avg:15.46ms
+step:489/975 train_loss:4.8593 train_time:7560ms step_avg:15.46ms
+step:490/975 train_loss:4.4953 train_time:7575ms step_avg:15.46ms
+step:491/975 train_loss:4.8608 train_time:7591ms step_avg:15.46ms
+step:492/975 train_loss:4.4411 train_time:7605ms step_avg:15.46ms
+step:493/975 train_loss:4.5932 train_time:7620ms step_avg:15.46ms
+step:494/975 train_loss:4.5018 train_time:7634ms step_avg:15.45ms
+step:495/975 train_loss:4.5285 train_time:7648ms step_avg:15.45ms
+step:496/975 train_loss:4.3076 train_time:7664ms step_avg:15.45ms
+step:497/975 train_loss:4.5631 train_time:7679ms step_avg:15.45ms
+step:498/975 train_loss:4.5974 train_time:7694ms step_avg:15.45ms
+step:499/975 train_loss:4.5385 train_time:7707ms step_avg:15.45ms
+step:500/975 train_loss:4.5079 train_time:7722ms step_avg:15.44ms
+step:501/975 train_loss:4.5915 train_time:7738ms step_avg:15.44ms
+step:502/975 train_loss:4.6306 train_time:7752ms step_avg:15.44ms
+step:503/975 train_loss:4.4396 train_time:7766ms step_avg:15.44ms
+step:504/975 train_loss:4.5505 train_time:7781ms step_avg:15.44ms
+step:505/975 train_loss:4.6480 train_time:7796ms step_avg:15.44ms
+step:506/975 train_loss:4.4299 train_time:7812ms step_avg:15.44ms
+step:507/975 train_loss:4.5238 train_time:7825ms step_avg:15.43ms
+step:508/975 train_loss:4.4797 train_time:7840ms step_avg:15.43ms
+step:509/975 train_loss:4.5637 train_time:7855ms step_avg:15.43ms
+step:510/975 train_loss:4.6669 train_time:7869ms step_avg:15.43ms
+step:511/975 train_loss:4.7027 train_time:7884ms step_avg:15.43ms
+step:512/975 train_loss:4.4891 train_time:7899ms step_avg:15.43ms
+step:513/975 train_loss:4.5172 train_time:7914ms step_avg:15.43ms
+step:514/975 train_loss:4.6966 train_time:7928ms step_avg:15.42ms
+step:515/975 train_loss:4.4483 train_time:7943ms step_avg:15.42ms
+step:516/975 train_loss:4.5996 train_time:7958ms step_avg:15.42ms
+step:517/975 train_loss:4.4740 train_time:7972ms step_avg:15.42ms
+step:518/975 train_loss:4.6591 train_time:7987ms step_avg:15.42ms
+step:519/975 train_loss:4.7556 train_time:8002ms step_avg:15.42ms
+step:520/975 train_loss:4.5560 train_time:8017ms step_avg:15.42ms
+step:521/975 train_loss:4.5973 train_time:8032ms step_avg:15.42ms
+step:522/975 train_loss:4.6601 train_time:8046ms step_avg:15.41ms
+step:523/975 train_loss:4.6236 train_time:8061ms step_avg:15.41ms
+step:524/975 train_loss:4.7074 train_time:8076ms step_avg:15.41ms
+step:525/975 train_loss:4.7977 train_time:8090ms step_avg:15.41ms
+step:526/975 train_loss:4.6779 train_time:8105ms step_avg:15.41ms
+step:527/975 train_loss:4.4642 train_time:8119ms step_avg:15.41ms
+step:528/975 train_loss:4.4570 train_time:8135ms step_avg:15.41ms
+step:529/975 train_loss:4.6733 train_time:8149ms step_avg:15.41ms
+step:530/975 train_loss:4.6602 train_time:8164ms step_avg:15.40ms
+step:531/975 train_loss:4.5963 train_time:8180ms step_avg:15.40ms
+step:532/975 train_loss:4.5744 train_time:8194ms step_avg:15.40ms
+step:533/975 train_loss:4.6051 train_time:8208ms step_avg:15.40ms
+step:534/975 train_loss:4.5621 train_time:8223ms step_avg:15.40ms
+step:535/975 train_loss:4.7271 train_time:8238ms step_avg:15.40ms
+step:536/975 train_loss:4.4277 train_time:8253ms step_avg:15.40ms
+step:537/975 train_loss:4.3721 train_time:8268ms step_avg:15.40ms
+step:538/975 train_loss:4.6785 train_time:8282ms step_avg:15.39ms
+step:539/975 train_loss:4.7962 train_time:8297ms step_avg:15.39ms
+step:540/975 train_loss:4.5997 train_time:8311ms step_avg:15.39ms
+step:541/975 train_loss:4.6847 train_time:8326ms step_avg:15.39ms
+step:542/975 train_loss:4.6506 train_time:8341ms step_avg:15.39ms
+step:543/975 train_loss:4.5782 train_time:8355ms step_avg:15.39ms
+step:544/975 train_loss:4.7549 train_time:8370ms step_avg:15.39ms
+step:545/975 train_loss:4.6113 train_time:8385ms step_avg:15.39ms
+step:546/975 train_loss:4.5320 train_time:8400ms step_avg:15.38ms
+step:547/975 train_loss:4.6504 train_time:8415ms step_avg:15.38ms
+step:548/975 train_loss:4.7157 train_time:8429ms step_avg:15.38ms
+step:549/975 train_loss:4.4655 train_time:8444ms step_avg:15.38ms
+step:550/975 train_loss:4.7391 train_time:8458ms step_avg:15.38ms
+step:551/975 train_loss:4.4928 train_time:8474ms step_avg:15.38ms
+step:552/975 train_loss:4.5232 train_time:8488ms step_avg:15.38ms
+step:553/975 train_loss:4.4517 train_time:8502ms step_avg:15.38ms
+step:554/975 train_loss:4.5788 train_time:8518ms step_avg:15.38ms
+step:555/975 train_loss:4.4519 train_time:8532ms step_avg:15.37ms
+step:556/975 train_loss:4.5456 train_time:8546ms step_avg:15.37ms
+step:557/975 train_loss:4.5499 train_time:8562ms step_avg:15.37ms
+step:558/975 train_loss:4.5122 train_time:8578ms step_avg:15.37ms
+step:559/975 train_loss:4.4232 train_time:8591ms step_avg:15.37ms
+step:560/975 train_loss:4.5444 train_time:8606ms step_avg:15.37ms
+step:561/975 train_loss:4.4975 train_time:8620ms step_avg:15.37ms
+step:562/975 train_loss:4.4909 train_time:8635ms step_avg:15.36ms
+step:563/975 train_loss:4.5370 train_time:8649ms step_avg:15.36ms
+step:564/975 train_loss:4.5843 train_time:8665ms step_avg:15.36ms
+step:565/975 train_loss:4.4385 train_time:8681ms step_avg:15.36ms
+step:566/975 train_loss:4.6381 train_time:8695ms step_avg:15.36ms
+step:567/975 train_loss:4.4598 train_time:8709ms step_avg:15.36ms
+step:568/975 train_loss:4.4309 train_time:8723ms step_avg:15.36ms
+step:569/975 train_loss:4.5524 train_time:8740ms step_avg:15.36ms
+step:570/975 train_loss:4.2803 train_time:8753ms step_avg:15.36ms
+step:571/975 train_loss:4.4207 train_time:8769ms step_avg:15.36ms
+step:572/975 train_loss:4.3798 train_time:8783ms step_avg:15.35ms
+step:573/975 train_loss:4.5635 train_time:8797ms step_avg:15.35ms
+step:574/975 train_loss:4.4070 train_time:8811ms step_avg:15.35ms
+step:575/975 train_loss:4.5777 train_time:8827ms step_avg:15.35ms
+step:576/975 train_loss:4.4135 train_time:8841ms step_avg:15.35ms
+step:577/975 train_loss:4.4792 train_time:8856ms step_avg:15.35ms
+step:578/975 train_loss:4.3415 train_time:8871ms step_avg:15.35ms
+step:579/975 train_loss:4.5114 train_time:8885ms step_avg:15.35ms
+step:580/975 train_loss:4.5552 train_time:8901ms step_avg:15.35ms
+step:581/975 train_loss:4.6457 train_time:8914ms step_avg:15.34ms
+step:582/975 train_loss:4.3944 train_time:8929ms step_avg:15.34ms
+step:583/975 train_loss:4.4051 train_time:8944ms step_avg:15.34ms
+step:584/975 train_loss:4.3993 train_time:8959ms step_avg:15.34ms
+step:585/975 train_loss:4.6278 train_time:8974ms step_avg:15.34ms
+step:586/975 train_loss:4.4265 train_time:8988ms step_avg:15.34ms
+step:587/975 train_loss:4.4071 train_time:9003ms step_avg:15.34ms
+step:588/975 train_loss:4.4950 train_time:9018ms step_avg:15.34ms
+step:589/975 train_loss:4.6760 train_time:9033ms step_avg:15.34ms
+step:590/975 train_loss:4.7314 train_time:9047ms step_avg:15.33ms
+step:591/975 train_loss:4.5664 train_time:9062ms step_avg:15.33ms
+step:592/975 train_loss:4.4036 train_time:9077ms step_avg:15.33ms
+step:593/975 train_loss:4.6743 train_time:9093ms step_avg:15.33ms
+step:594/975 train_loss:4.7901 train_time:9106ms step_avg:15.33ms
+step:595/975 train_loss:4.4137 train_time:9120ms step_avg:15.33ms
+step:596/975 train_loss:4.6596 train_time:9136ms step_avg:15.33ms
+step:597/975 train_loss:4.5752 train_time:9151ms step_avg:15.33ms
+step:598/975 train_loss:4.4611 train_time:9165ms step_avg:15.33ms
+step:599/975 train_loss:4.5603 train_time:9180ms step_avg:15.33ms
+step:600/975 train_loss:4.6247 train_time:9195ms step_avg:15.32ms
+step:601/975 train_loss:4.2444 train_time:9209ms step_avg:15.32ms
+step:602/975 train_loss:4.4151 train_time:9224ms step_avg:15.32ms
+step:603/975 train_loss:4.6181 train_time:9239ms step_avg:15.32ms
+step:604/975 train_loss:4.4207 train_time:9254ms step_avg:15.32ms
+step:605/975 train_loss:4.5309 train_time:9268ms step_avg:15.32ms
+step:606/975 train_loss:4.5785 train_time:9282ms step_avg:15.32ms
+step:607/975 train_loss:4.5906 train_time:9298ms step_avg:15.32ms
+step:608/975 train_loss:4.5549 train_time:9312ms step_avg:15.32ms
+step:609/975 train_loss:4.6174 train_time:9327ms step_avg:15.32ms
+step:610/975 train_loss:4.4262 train_time:9341ms step_avg:15.31ms
+step:611/975 train_loss:4.3889 train_time:9357ms step_avg:15.31ms
+step:612/975 train_loss:4.3892 train_time:9371ms step_avg:15.31ms
+step:613/975 train_loss:4.5871 train_time:9386ms step_avg:15.31ms
+step:614/975 train_loss:4.3210 train_time:9400ms step_avg:15.31ms
+step:615/975 train_loss:4.5081 train_time:9416ms step_avg:15.31ms
+step:616/975 train_loss:4.4576 train_time:9430ms step_avg:15.31ms
+step:617/975 train_loss:4.4721 train_time:9445ms step_avg:15.31ms
+step:618/975 train_loss:4.3737 train_time:9459ms step_avg:15.31ms
+step:619/975 train_loss:4.3312 train_time:9474ms step_avg:15.30ms
+step:620/975 train_loss:4.5539 train_time:9489ms step_avg:15.30ms
+step:621/975 train_loss:4.5361 train_time:9503ms step_avg:15.30ms
+step:622/975 train_loss:4.4419 train_time:9519ms step_avg:15.30ms
+step:623/975 train_loss:4.3060 train_time:9533ms step_avg:15.30ms
+step:624/975 train_loss:4.3210 train_time:9547ms step_avg:15.30ms
+step:625/975 train_loss:4.6959 train_time:9562ms step_avg:15.30ms
+step:626/975 train_loss:4.3387 train_time:9578ms step_avg:15.30ms
+step:627/975 train_loss:4.5503 train_time:9591ms step_avg:15.30ms
+step:628/975 train_loss:4.3993 train_time:9607ms step_avg:15.30ms
+step:629/975 train_loss:4.5201 train_time:9621ms step_avg:15.29ms
+step:630/975 train_loss:4.6624 train_time:9636ms step_avg:15.30ms
+step:631/975 train_loss:4.4664 train_time:9652ms step_avg:15.30ms
+step:632/975 train_loss:4.4184 train_time:9665ms step_avg:15.29ms
+step:633/975 train_loss:4.4031 train_time:9680ms step_avg:15.29ms
+step:634/975 train_loss:4.4426 train_time:9695ms step_avg:15.29ms
+step:635/975 train_loss:4.3666 train_time:9709ms step_avg:15.29ms
+step:636/975 train_loss:4.5469 train_time:9725ms step_avg:15.29ms
+step:637/975 train_loss:4.3793 train_time:9740ms step_avg:15.29ms
+step:638/975 train_loss:4.4256 train_time:9754ms step_avg:15.29ms
+step:639/975 train_loss:4.3916 train_time:9768ms step_avg:15.29ms
+step:640/975 train_loss:4.3876 train_time:9783ms step_avg:15.29ms
+step:641/975 train_loss:4.3567 train_time:9799ms step_avg:15.29ms
+step:642/975 train_loss:4.4547 train_time:9813ms step_avg:15.29ms
+step:643/975 train_loss:4.5206 train_time:9828ms step_avg:15.28ms
+step:644/975 train_loss:4.5401 train_time:9841ms step_avg:15.28ms
+step:645/975 train_loss:4.3917 train_time:9857ms step_avg:15.28ms
+step:646/975 train_loss:4.3735 train_time:9875ms step_avg:15.29ms
+step:647/975 train_loss:4.4495 train_time:9887ms step_avg:15.28ms
+step:648/975 train_loss:4.5572 train_time:9901ms step_avg:15.28ms
+step:649/975 train_loss:4.4235 train_time:9918ms step_avg:15.28ms
+step:650/975 train_loss:4.5532 train_time:9931ms step_avg:15.28ms
+step:651/975 train_loss:4.5977 train_time:9945ms step_avg:15.28ms
+step:652/975 train_loss:4.3735 train_time:9960ms step_avg:15.28ms
+step:653/975 train_loss:4.3353 train_time:9975ms step_avg:15.28ms
+step:654/975 train_loss:4.4518 train_time:9989ms step_avg:15.27ms
+step:655/975 train_loss:4.3789 train_time:10004ms step_avg:15.27ms
+step:656/975 train_loss:4.4502 train_time:10019ms step_avg:15.27ms
+step:657/975 train_loss:4.5680 train_time:10033ms step_avg:15.27ms
+step:658/975 train_loss:4.4457 train_time:10048ms step_avg:15.27ms
+step:659/975 train_loss:4.3313 train_time:10063ms step_avg:15.27ms
+step:660/975 train_loss:4.3528 train_time:10078ms step_avg:15.27ms
+step:661/975 train_loss:4.5543 train_time:10093ms step_avg:15.27ms
+step:662/975 train_loss:4.1275 train_time:10107ms step_avg:15.27ms
+step:663/975 train_loss:4.3509 train_time:10123ms step_avg:15.27ms
+step:664/975 train_loss:4.3876 train_time:10136ms step_avg:15.27ms
+step:665/975 train_loss:4.4214 train_time:10153ms step_avg:15.27ms
+step:666/975 train_loss:4.3371 train_time:10166ms step_avg:15.26ms
+step:667/975 train_loss:4.3070 train_time:10181ms step_avg:15.26ms
+step:668/975 train_loss:4.7367 train_time:10196ms step_avg:15.26ms
+step:669/975 train_loss:4.3264 train_time:10209ms step_avg:15.26ms
+step:670/975 train_loss:4.3683 train_time:10224ms step_avg:15.26ms
+step:671/975 train_loss:4.3177 train_time:10240ms step_avg:15.26ms
+step:672/975 train_loss:4.4539 train_time:10255ms step_avg:15.26ms
+step:673/975 train_loss:4.3344 train_time:10269ms step_avg:15.26ms
+step:674/975 train_loss:4.6077 train_time:10283ms step_avg:15.26ms
+step:675/975 train_loss:4.3338 train_time:10299ms step_avg:15.26ms
+step:676/975 train_loss:4.4054 train_time:10313ms step_avg:15.26ms
+step:677/975 train_loss:4.4230 train_time:10328ms step_avg:15.26ms
+step:678/975 train_loss:4.5251 train_time:10343ms step_avg:15.25ms
+step:679/975 train_loss:4.3946 train_time:10357ms step_avg:15.25ms
+step:680/975 train_loss:4.4870 train_time:10373ms step_avg:15.25ms
+step:681/975 train_loss:4.4307 train_time:10387ms step_avg:15.25ms
+step:682/975 train_loss:4.3922 train_time:10402ms step_avg:15.25ms
+step:683/975 train_loss:4.5035 train_time:10417ms step_avg:15.25ms
+step:684/975 train_loss:4.3920 train_time:10432ms step_avg:15.25ms
+step:685/975 train_loss:4.3810 train_time:10445ms step_avg:15.25ms
+step:686/975 train_loss:4.1828 train_time:10462ms step_avg:15.25ms
+step:687/975 train_loss:4.4960 train_time:10475ms step_avg:15.25ms
+step:688/975 train_loss:4.3478 train_time:10490ms step_avg:15.25ms
+step:689/975 train_loss:4.4236 train_time:10504ms step_avg:15.25ms
+step:690/975 train_loss:4.7190 train_time:10519ms step_avg:15.25ms
+step:691/975 train_loss:4.4063 train_time:10534ms step_avg:15.24ms
+step:692/975 train_loss:4.4657 train_time:10548ms step_avg:15.24ms
+step:693/975 train_loss:4.4760 train_time:10564ms step_avg:15.24ms
+step:694/975 train_loss:4.3482 train_time:10579ms step_avg:15.24ms
+step:695/975 train_loss:4.3467 train_time:10593ms step_avg:15.24ms
+step:696/975 train_loss:4.5593 train_time:10607ms step_avg:15.24ms
+step:697/975 train_loss:4.1883 train_time:10622ms step_avg:15.24ms
+step:698/975 train_loss:4.3085 train_time:10637ms step_avg:15.24ms
+step:699/975 train_loss:4.2834 train_time:10652ms step_avg:15.24ms
+step:700/975 train_loss:4.3003 train_time:10667ms step_avg:15.24ms
+step:701/975 train_loss:4.3351 train_time:10681ms step_avg:15.24ms
+step:702/975 train_loss:4.2073 train_time:10701ms step_avg:15.24ms
+step:703/975 train_loss:4.3995 train_time:10715ms step_avg:15.24ms
+step:704/975 train_loss:4.3464 train_time:10728ms step_avg:15.24ms
+step:705/975 train_loss:4.3356 train_time:10741ms step_avg:15.24ms
+step:706/975 train_loss:4.2503 train_time:10755ms step_avg:15.23ms
+step:707/975 train_loss:4.5052 train_time:10769ms step_avg:15.23ms
+step:708/975 train_loss:4.2052 train_time:10785ms step_avg:15.23ms
+step:709/975 train_loss:4.4920 train_time:10800ms step_avg:15.23ms
+step:710/975 train_loss:4.4628 train_time:10814ms step_avg:15.23ms
+step:711/975 train_loss:4.4110 train_time:10828ms step_avg:15.23ms
+step:712/975 train_loss:4.3103 train_time:10843ms step_avg:15.23ms
+step:713/975 train_loss:4.3478 train_time:10859ms step_avg:15.23ms
+step:714/975 train_loss:4.3782 train_time:10873ms step_avg:15.23ms
+step:715/975 train_loss:4.4687 train_time:10887ms step_avg:15.23ms
+step:716/975 train_loss:4.3810 train_time:10902ms step_avg:15.23ms
+step:717/975 train_loss:4.3016 train_time:10917ms step_avg:15.23ms
+step:718/975 train_loss:4.4123 train_time:10931ms step_avg:15.22ms
+step:719/975 train_loss:3.9426 train_time:10947ms step_avg:15.23ms
+step:720/975 train_loss:4.0431 train_time:10961ms step_avg:15.22ms
+step:721/975 train_loss:4.3989 train_time:10976ms step_avg:15.22ms
+step:722/975 train_loss:4.4798 train_time:10990ms step_avg:15.22ms
+step:723/975 train_loss:4.2331 train_time:11005ms step_avg:15.22ms
+step:724/975 train_loss:4.4537 train_time:11019ms step_avg:15.22ms
+step:725/975 train_loss:4.2574 train_time:11039ms step_avg:15.23ms
+step:726/975 train_loss:4.3824 train_time:11052ms step_avg:15.22ms
+step:727/975 train_loss:4.2187 train_time:11065ms step_avg:15.22ms
+step:728/975 train_loss:4.3109 train_time:11079ms step_avg:15.22ms
+step:729/975 train_loss:4.2733 train_time:11095ms step_avg:15.22ms
+step:730/975 train_loss:4.2699 train_time:11109ms step_avg:15.22ms
+step:731/975 train_loss:4.3891 train_time:11123ms step_avg:15.22ms
+step:732/975 train_loss:4.2503 train_time:11138ms step_avg:15.22ms
+step:733/975 train_loss:4.4377 train_time:11152ms step_avg:15.21ms
+step:734/975 train_loss:4.2526 train_time:11167ms step_avg:15.21ms
+step:735/975 train_loss:4.1915 train_time:11180ms step_avg:15.21ms
+step:736/975 train_loss:4.3770 train_time:11197ms step_avg:15.21ms
+step:737/975 train_loss:4.4532 train_time:11212ms step_avg:15.21ms
+step:738/975 train_loss:4.4116 train_time:11226ms step_avg:15.21ms
+step:739/975 train_loss:4.4815 train_time:11241ms step_avg:15.21ms
+step:740/975 train_loss:4.3095 train_time:11256ms step_avg:15.21ms
+step:741/975 train_loss:4.2670 train_time:11270ms step_avg:15.21ms
+step:742/975 train_loss:4.3015 train_time:11285ms step_avg:15.21ms
+step:743/975 train_loss:4.1511 train_time:11300ms step_avg:15.21ms
+step:744/975 train_loss:4.4244 train_time:11314ms step_avg:15.21ms
+step:745/975 train_loss:4.4455 train_time:11329ms step_avg:15.21ms
+step:746/975 train_loss:4.4382 train_time:11343ms step_avg:15.20ms
+step:747/975 train_loss:4.3443 train_time:11359ms step_avg:15.21ms
+step:748/975 train_loss:4.1353 train_time:11373ms step_avg:15.20ms
+step:749/975 train_loss:4.2004 train_time:11387ms step_avg:15.20ms
+step:750/975 train_loss:4.3029 train_time:11403ms step_avg:15.20ms
+step:751/975 train_loss:4.4283 train_time:11417ms step_avg:15.20ms
+step:752/975 train_loss:4.1522 train_time:11432ms step_avg:15.20ms
+step:753/975 train_loss:4.4535 train_time:11447ms step_avg:15.20ms
+step:754/975 train_loss:4.2356 train_time:11462ms step_avg:15.20ms
+step:755/975 train_loss:4.2002 train_time:11476ms step_avg:15.20ms
+step:756/975 train_loss:4.3403 train_time:11491ms step_avg:15.20ms
+step:757/975 train_loss:4.1218 train_time:11505ms step_avg:15.20ms
+step:758/975 train_loss:4.4083 train_time:11521ms step_avg:15.20ms
+step:759/975 train_loss:4.3985 train_time:11535ms step_avg:15.20ms
+step:760/975 train_loss:4.3038 train_time:11550ms step_avg:15.20ms
+step:761/975 train_loss:4.3477 train_time:11564ms step_avg:15.20ms
+step:762/975 train_loss:4.5168 train_time:11579ms step_avg:15.20ms
+step:763/975 train_loss:4.3032 train_time:11594ms step_avg:15.19ms
+step:764/975 train_loss:4.3424 train_time:11609ms step_avg:15.19ms
+step:765/975 train_loss:4.1964 train_time:11623ms step_avg:15.19ms
+step:766/975 train_loss:4.3441 train_time:11638ms step_avg:15.19ms
+step:767/975 train_loss:4.2567 train_time:11652ms step_avg:15.19ms
+step:768/975 train_loss:4.1410 train_time:11667ms step_avg:15.19ms
+step:769/975 train_loss:4.1264 train_time:11681ms step_avg:15.19ms
+step:770/975 train_loss:4.3398 train_time:11698ms step_avg:15.19ms
+step:771/975 train_loss:4.2923 train_time:11712ms step_avg:15.19ms
+step:772/975 train_loss:4.3393 train_time:11727ms step_avg:15.19ms
+step:773/975 train_loss:4.2543 train_time:11741ms step_avg:15.19ms
+step:774/975 train_loss:3.9900 train_time:11756ms step_avg:15.19ms
+step:775/975 train_loss:4.3354 train_time:11771ms step_avg:15.19ms
+step:776/975 train_loss:4.3730 train_time:11787ms step_avg:15.19ms
+step:777/975 train_loss:4.3055 train_time:11800ms step_avg:15.19ms
+step:778/975 train_loss:4.4045 train_time:11815ms step_avg:15.19ms
+step:779/975 train_loss:4.3891 train_time:11830ms step_avg:15.19ms
+step:780/975 train_loss:4.3368 train_time:11891ms step_avg:15.24ms
+step:781/975 train_loss:4.4850 train_time:11904ms step_avg:15.24ms
+step:782/975 train_loss:4.4097 train_time:11917ms step_avg:15.24ms
+step:783/975 train_loss:4.3559 train_time:11934ms step_avg:15.24ms
+step:784/975 train_loss:4.2637 train_time:11952ms step_avg:15.25ms
+step:785/975 train_loss:4.2888 train_time:11969ms step_avg:15.25ms
+step:786/975 train_loss:4.3506 train_time:11986ms step_avg:15.25ms
+step:787/975 train_loss:4.3042 train_time:12004ms step_avg:15.25ms
+step:788/975 train_loss:4.3108 train_time:12023ms step_avg:15.26ms
+step:789/975 train_loss:4.2962 train_time:12040ms step_avg:15.26ms
+step:790/975 train_loss:4.2645 train_time:12058ms step_avg:15.26ms
+step:791/975 train_loss:4.1353 train_time:12076ms step_avg:15.27ms
+step:792/975 train_loss:4.4849 train_time:12094ms step_avg:15.27ms
+step:793/975 train_loss:4.1640 train_time:12111ms step_avg:15.27ms
+step:794/975 train_loss:4.5253 train_time:12128ms step_avg:15.27ms
+step:795/975 train_loss:4.2040 train_time:12146ms step_avg:15.28ms
+step:796/975 train_loss:4.2430 train_time:12163ms step_avg:15.28ms
+step:797/975 train_loss:4.2962 train_time:12182ms step_avg:15.29ms
+step:798/975 train_loss:4.1573 train_time:12200ms step_avg:15.29ms
+step:799/975 train_loss:4.2104 train_time:12218ms step_avg:15.29ms
+step:800/975 train_loss:4.3890 train_time:12235ms step_avg:15.29ms
+step:801/975 train_loss:4.3304 train_time:12253ms step_avg:15.30ms
+step:802/975 train_loss:4.3524 train_time:12272ms step_avg:15.30ms
+step:803/975 train_loss:4.2552 train_time:12292ms step_avg:15.31ms
+step:804/975 train_loss:4.2252 train_time:12306ms step_avg:15.31ms
+step:805/975 train_loss:4.1470 train_time:12323ms step_avg:15.31ms
+step:806/975 train_loss:4.4548 train_time:12342ms step_avg:15.31ms
+step:807/975 train_loss:4.3167 train_time:12360ms step_avg:15.32ms
+step:808/975 train_loss:4.2160 train_time:12378ms step_avg:15.32ms
+step:809/975 train_loss:3.9907 train_time:12395ms step_avg:15.32ms
+step:810/975 train_loss:4.3234 train_time:12414ms step_avg:15.33ms
+step:811/975 train_loss:4.2056 train_time:12431ms step_avg:15.33ms
+step:812/975 train_loss:4.2729 train_time:12449ms step_avg:15.33ms
+step:813/975 train_loss:4.3955 train_time:12466ms step_avg:15.33ms
+step:814/975 train_loss:4.2210 train_time:12483ms step_avg:15.34ms
+step:815/975 train_loss:4.2563 train_time:12501ms step_avg:15.34ms
+step:816/975 train_loss:4.2499 train_time:12520ms step_avg:15.34ms
+step:817/975 train_loss:4.1396 train_time:12537ms step_avg:15.35ms
+step:818/975 train_loss:4.2041 train_time:12555ms step_avg:15.35ms
+step:819/975 train_loss:4.2357 train_time:12573ms step_avg:15.35ms
+step:820/975 train_loss:4.3338 train_time:12591ms step_avg:15.36ms
+step:821/975 train_loss:4.3498 train_time:12609ms step_avg:15.36ms
+step:822/975 train_loss:4.1720 train_time:12625ms step_avg:15.36ms
+step:823/975 train_loss:4.2680 train_time:12644ms step_avg:15.36ms
+step:824/975 train_loss:4.2313 train_time:12661ms step_avg:15.37ms
+step:825/975 train_loss:4.1889 train_time:12680ms step_avg:15.37ms
+step:826/975 train_loss:4.3262 train_time:12698ms step_avg:15.37ms
+step:827/975 train_loss:4.4120 train_time:12716ms step_avg:15.38ms
+step:828/975 train_loss:4.2919 train_time:12736ms step_avg:15.38ms
+step:829/975 train_loss:4.2332 train_time:12750ms step_avg:15.38ms
+step:830/975 train_loss:4.3601 train_time:12769ms step_avg:15.38ms
+step:831/975 train_loss:4.3564 train_time:12785ms step_avg:15.39ms
+step:832/975 train_loss:4.2451 train_time:12804ms step_avg:15.39ms
+step:833/975 train_loss:4.2055 train_time:12821ms step_avg:15.39ms
+step:834/975 train_loss:4.4824 train_time:12839ms step_avg:15.39ms
+step:835/975 train_loss:4.0924 train_time:12857ms step_avg:15.40ms
+step:836/975 train_loss:4.0275 train_time:12874ms step_avg:15.40ms
+step:837/975 train_loss:4.3583 train_time:12893ms step_avg:15.40ms
+step:838/975 train_loss:4.0478 train_time:12910ms step_avg:15.41ms
+step:839/975 train_loss:4.3140 train_time:12927ms step_avg:15.41ms
+step:840/975 train_loss:4.2561 train_time:12945ms step_avg:15.41ms
+step:841/975 train_loss:4.1264 train_time:12966ms step_avg:15.42ms
+step:842/975 train_loss:4.1553 train_time:12981ms step_avg:15.42ms
+step:843/975 train_loss:4.2782 train_time:13000ms step_avg:15.42ms
+step:844/975 train_loss:4.1804 train_time:13017ms step_avg:15.42ms
+step:845/975 train_loss:4.2554 train_time:13034ms step_avg:15.43ms
+step:846/975 train_loss:4.2534 train_time:13053ms step_avg:15.43ms
+step:847/975 train_loss:4.0791 train_time:13069ms step_avg:15.43ms
+step:848/975 train_loss:3.9927 train_time:13091ms step_avg:15.44ms
+step:849/975 train_loss:4.2708 train_time:13105ms step_avg:15.44ms
+step:850/975 train_loss:4.1353 train_time:13126ms step_avg:15.44ms
+step:851/975 train_loss:4.2238 train_time:13141ms step_avg:15.44ms
+step:852/975 train_loss:4.2084 train_time:13159ms step_avg:15.45ms
+step:853/975 train_loss:4.1951 train_time:13177ms step_avg:15.45ms
+step:854/975 train_loss:4.2278 train_time:13195ms step_avg:15.45ms
+step:855/975 train_loss:4.2438 train_time:13213ms step_avg:15.45ms
+step:856/975 train_loss:3.9885 train_time:13229ms step_avg:15.45ms
+step:857/975 train_loss:4.2372 train_time:13246ms step_avg:15.46ms
+step:858/975 train_loss:4.2506 train_time:13264ms step_avg:15.46ms
+step:859/975 train_loss:4.2041 train_time:13287ms step_avg:15.47ms
+step:860/975 train_loss:4.1473 train_time:13300ms step_avg:15.47ms
+step:861/975 train_loss:4.0830 train_time:13319ms step_avg:15.47ms
+step:862/975 train_loss:4.3421 train_time:13337ms step_avg:15.47ms
+step:863/975 train_loss:4.2794 train_time:13354ms step_avg:15.47ms
+step:864/975 train_loss:4.3746 train_time:13372ms step_avg:15.48ms
+step:865/975 train_loss:4.1126 train_time:13389ms step_avg:15.48ms
+step:866/975 train_loss:4.3918 train_time:13406ms step_avg:15.48ms
+step:867/975 train_loss:4.1808 train_time:13424ms step_avg:15.48ms
+step:868/975 train_loss:4.0961 train_time:13442ms step_avg:15.49ms
+step:869/975 train_loss:4.1556 train_time:13460ms step_avg:15.49ms
+step:870/975 train_loss:4.2363 train_time:13478ms step_avg:15.49ms
+step:871/975 train_loss:4.0255 train_time:13496ms step_avg:15.49ms
+step:872/975 train_loss:4.1465 train_time:13514ms step_avg:15.50ms
+step:873/975 train_loss:4.4089 train_time:13531ms step_avg:15.50ms
+step:874/975 train_loss:4.0918 train_time:13548ms step_avg:15.50ms
+step:875/975 train_loss:4.0602 train_time:13566ms step_avg:15.50ms
+step:876/975 train_loss:4.1460 train_time:13584ms step_avg:15.51ms
+step:877/975 train_loss:4.1632 train_time:13603ms step_avg:15.51ms
+step:878/975 train_loss:4.1309 train_time:13620ms step_avg:15.51ms
+step:879/975 train_loss:4.2811 train_time:13638ms step_avg:15.52ms
+step:880/975 train_loss:4.3152 train_time:13656ms step_avg:15.52ms
+step:881/975 train_loss:4.2133 train_time:13674ms step_avg:15.52ms
+step:882/975 train_loss:4.2184 train_time:13691ms step_avg:15.52ms
+step:883/975 train_loss:4.0937 train_time:13708ms step_avg:15.52ms
+step:884/975 train_loss:4.2772 train_time:13725ms step_avg:15.53ms
+step:885/975 train_loss:4.2491 train_time:13743ms step_avg:15.53ms
+step:886/975 train_loss:4.1490 train_time:13762ms step_avg:15.53ms
+step:887/975 train_loss:4.1120 train_time:13779ms step_avg:15.53ms
+step:888/975 train_loss:4.3160 train_time:13798ms step_avg:15.54ms
+step:889/975 train_loss:4.0934 train_time:13815ms step_avg:15.54ms
+step:890/975 train_loss:4.1540 train_time:13832ms step_avg:15.54ms
+step:891/975 train_loss:4.1374 train_time:13851ms step_avg:15.55ms
+step:892/975 train_loss:4.3053 train_time:13868ms step_avg:15.55ms
+step:893/975 train_loss:4.1297 train_time:13889ms step_avg:15.55ms
+step:894/975 train_loss:4.1977 train_time:13903ms step_avg:15.55ms
+step:895/975 train_loss:4.1704 train_time:13921ms step_avg:15.55ms
+step:896/975 train_loss:4.2148 train_time:13940ms step_avg:15.56ms
+step:897/975 train_loss:4.0321 train_time:13957ms step_avg:15.56ms
+step:898/975 train_loss:4.2354 train_time:13975ms step_avg:15.56ms
+step:899/975 train_loss:4.1539 train_time:13993ms step_avg:15.56ms
+step:900/975 train_loss:4.3912 train_time:14010ms step_avg:15.57ms
+step:901/975 train_loss:4.1781 train_time:14027ms step_avg:15.57ms
+step:902/975 train_loss:4.1910 train_time:14045ms step_avg:15.57ms
+step:903/975 train_loss:4.2032 train_time:14063ms step_avg:15.57ms
+step:904/975 train_loss:4.1124 train_time:14081ms step_avg:15.58ms
+step:905/975 train_loss:4.0677 train_time:14099ms step_avg:15.58ms
+step:906/975 train_loss:4.1597 train_time:14118ms step_avg:15.58ms
+step:907/975 train_loss:4.2285 train_time:14135ms step_avg:15.58ms
+step:908/975 train_loss:4.1657 train_time:14152ms step_avg:15.59ms
+step:909/975 train_loss:4.0466 train_time:14169ms step_avg:15.59ms
+step:910/975 train_loss:4.1530 train_time:14187ms step_avg:15.59ms
+step:911/975 train_loss:4.2116 train_time:14205ms step_avg:15.59ms
+step:912/975 train_loss:3.9723 train_time:14223ms step_avg:15.60ms
+step:913/975 train_loss:4.2567 train_time:14240ms step_avg:15.60ms
+step:914/975 train_loss:4.1190 train_time:14259ms step_avg:15.60ms
+step:915/975 train_loss:4.1927 train_time:14277ms step_avg:15.60ms
+step:916/975 train_loss:4.1040 train_time:14296ms step_avg:15.61ms
+step:917/975 train_loss:3.9817 train_time:14312ms step_avg:15.61ms
+step:918/975 train_loss:4.0921 train_time:14329ms step_avg:15.61ms
+step:919/975 train_loss:4.2218 train_time:14348ms step_avg:15.61ms
+step:920/975 train_loss:4.1716 train_time:14364ms step_avg:15.61ms
+step:921/975 train_loss:4.3017 train_time:14384ms step_avg:15.62ms
+step:922/975 train_loss:4.3514 train_time:14401ms step_avg:15.62ms
+step:923/975 train_loss:4.1589 train_time:14419ms step_avg:15.62ms
+step:924/975 train_loss:4.0516 train_time:14437ms step_avg:15.62ms
+step:925/975 train_loss:4.0846 train_time:14454ms step_avg:15.63ms
+step:926/975 train_loss:4.1190 train_time:14472ms step_avg:15.63ms
+step:927/975 train_loss:3.9820 train_time:14490ms step_avg:15.63ms
+step:928/975 train_loss:4.1709 train_time:14507ms step_avg:15.63ms
+step:929/975 train_loss:4.1926 train_time:14525ms step_avg:15.63ms
+step:930/975 train_loss:4.4060 train_time:14543ms step_avg:15.64ms
+step:931/975 train_loss:4.1464 train_time:14560ms step_avg:15.64ms
+step:932/975 train_loss:4.0434 train_time:14578ms step_avg:15.64ms
+step:933/975 train_loss:4.0646 train_time:14596ms step_avg:15.64ms
+step:934/975 train_loss:4.5729 train_time:14613ms step_avg:15.65ms
+step:935/975 train_loss:4.4575 train_time:14632ms step_avg:15.65ms
+step:936/975 train_loss:4.3716 train_time:14649ms step_avg:15.65ms
+step:937/975 train_loss:4.1927 train_time:14667ms step_avg:15.65ms
+step:938/975 train_loss:4.1696 train_time:14684ms step_avg:15.65ms
+step:939/975 train_loss:4.2322 train_time:14703ms step_avg:15.66ms
+step:940/975 train_loss:4.1669 train_time:14720ms step_avg:15.66ms
+step:941/975 train_loss:4.0298 train_time:14738ms step_avg:15.66ms
+step:942/975 train_loss:4.1452 train_time:14758ms step_avg:15.67ms
+step:943/975 train_loss:4.2271 train_time:14773ms step_avg:15.67ms
+step:944/975 train_loss:4.2435 train_time:14793ms step_avg:15.67ms
+step:945/975 train_loss:4.2368 train_time:14809ms step_avg:15.67ms
+step:946/975 train_loss:4.2407 train_time:14827ms step_avg:15.67ms
+step:947/975 train_loss:4.3643 train_time:14844ms step_avg:15.67ms
+step:948/975 train_loss:4.2217 train_time:14863ms step_avg:15.68ms
+step:949/975 train_loss:4.0964 train_time:14883ms step_avg:15.68ms
+step:950/975 train_loss:4.0313 train_time:14898ms step_avg:15.68ms
+step:951/975 train_loss:4.2341 train_time:14916ms step_avg:15.68ms
+step:952/975 train_loss:4.0445 train_time:14933ms step_avg:15.69ms
+step:953/975 train_loss:4.2027 train_time:14951ms step_avg:15.69ms
+step:954/975 train_loss:4.2892 train_time:14968ms step_avg:15.69ms
+step:955/975 train_loss:4.0838 train_time:14986ms step_avg:15.69ms
+step:956/975 train_loss:4.1460 train_time:15005ms step_avg:15.70ms
+step:957/975 train_loss:4.2197 train_time:15021ms step_avg:15.70ms
+step:958/975 train_loss:4.1840 train_time:15040ms step_avg:15.70ms
+step:959/975 train_loss:4.0586 train_time:15058ms step_avg:15.70ms
+step:960/975 train_loss:4.2365 train_time:15075ms step_avg:15.70ms
+step:961/975 train_loss:4.1617 train_time:15093ms step_avg:15.71ms
+step:962/975 train_loss:4.0320 train_time:15111ms step_avg:15.71ms
+step:963/975 train_loss:4.3036 train_time:15128ms step_avg:15.71ms
+step:964/975 train_loss:4.2245 train_time:15146ms step_avg:15.71ms
+step:965/975 train_loss:4.1920 train_time:15164ms step_avg:15.71ms
+step:966/975 train_loss:4.2241 train_time:15181ms step_avg:15.72ms
+step:967/975 train_loss:4.1673 train_time:15200ms step_avg:15.72ms
+step:968/975 train_loss:4.2013 train_time:15217ms step_avg:15.72ms
+step:969/975 train_loss:3.9965 train_time:15236ms step_avg:15.72ms
+step:970/975 train_loss:4.1276 train_time:15253ms step_avg:15.73ms
+step:971/975 train_loss:3.9996 train_time:15271ms step_avg:15.73ms
+step:972/975 train_loss:4.3237 train_time:15288ms step_avg:15.73ms
+step:973/975 train_loss:4.2320 train_time:15305ms step_avg:15.73ms
+step:974/975 train_loss:4.2007 train_time:15323ms step_avg:15.73ms
+step:975/975 train_loss:4.2287 train_time:15347ms step_avg:15.74ms
+step:975/975 val_loss:4.1797 tokens:7,987,200 train_time:15347ms step_avg:15.74ms
+reached target 4.2: {"step": 975, "tokens": 7987200, "train_time": 15.346764683999936, "val_loss": 4.179657879997702}
+peak memory per GPU: 2.5 GiB
+result: {"reached": {"step": 975, "tokens": 7987200, "train_time": 15.346764683999936, "val_loss": 4.179657879997702}, "final": {"val_loss": 4.179657879997702, "passed": true}, "steps": 975, "train_time": 15.346764683999936}

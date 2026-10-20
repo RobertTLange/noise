@@ -1,0 +1,4 @@
+# The JAX trainer's stack, next to the benchmark's torch (pyproject.toml) for data loading and evaluation.
+jax[cuda13]==0.11.2
+absl-py  # jax.experimental.pallas.ops.gpu (the relu² matmul kernel's Hopper path) imports it
+numpy>=2.0

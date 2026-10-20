@@ -55,8 +55,16 @@ and `val.pt` of the [Dust repo](https://github.com/qlabs-eng/dust). Both are che
 
 ```bash
 uv run torchrun --standalone --nproc_per_node=8 train/val/run.py         # track 1
-uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py    # track 2
 uv run torchrun --standalone --nproc_per_node=8 train/val/eggroll.py
+```
+
+The track-2 record trains in JAX ([`train/speedrun/jax/`](train/speedrun/jax/README.md)) and runs as one process on
+all 8 GPUs. Install JAX into the same environment after `uv sync` (a later `uv sync` removes it again; `uv run`
+keeps it):
+
+```bash
+uv pip install -r train/speedrun/jax/requirements.txt
+uv run python train/speedrun/run.py                                     # track 2
 ```
 
 Each run writes `config.json`, `metrics.jsonl`, `final.pt` and `result.json` (validation loss and training time)
@@ -90,6 +98,7 @@ to `logs/`. `uv run utils/eval.py logs/val/final.pt` rescores a checkpoint.
 | 5 | 4.180 | Boost on 4,200 sequences, larger probe chunks, max-autotune | 4 min 21 s | [Script](https://github.com/qlabs-eng/noise/blob/cb06760d590b2112de2e876875c9e545f8c9dd10/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
 | 6 | 4.169 | Boost: closed-form hub and value credit, exact keys, 3,600 sequences | 2 min 37 s | [Script](https://github.com/qlabs-eng/noise/blob/300034eebc22d88b277e155e75e71bfe5fda68cf/train/speedrun/run.py) | [@Euraba](https://github.com/Euraba) |
 | 7 | 4.176 | Identity-path credit with exact values: no Boost or Cut phases | 1 min 23 s | [Script](https://github.com/qlabs-eng/noise/blob/2b592c572f2a103a8990a222cb316d9909577704/train/speedrun/run.py) | [@Lazarus-931](https://github.com/Lazarus-931) |
+| 8 | 4.180 | Identity path in JAX: exact queries, all-unit MLP credit, token-sharded estimate, 4 rows × 975 updates | 15.3 s | [Script](train/speedrun/run.py) | [@RobertTLange](https://github.com/RobertTLange) |
 
 ## What backprop gets
 
