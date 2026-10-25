@@ -128,26 +128,3 @@ uv run utils/eval.py logs/arch/final.pt --model train/arch/model.py
 ```
 
 torch 2.10.0 (cu128), Triton from it. Peak memory is 48.9 GB in training and 58.8 GB in the end merge.
-
-## Notes for reviewers
-
-- **The script is the record's trainer, without the round's switched-off experiments.**
-  - The record's command-line flags are now the defaults (`Settings` fields, `HOLDOUT = 64`, `--eval-every 125`).
-  - The experiments that were off in the record are removed: memory slots, hash experts, depth banks, linear
-    attention, parallel and bilinear blocks, residual n-gram writes, chain subspaces and skips, and track 2's
-    identity phase. Upstream's own switches stay (Boost, future-token probes, value and gate paths).
-  - `run.py` is 3,000 lines and `model.py` differs from upstream only by the config, value embeddings on every block
-    and the n-gram tables.
-  - `log/config.json` records the run in its original flag form.
-- **Parity with the trainer that produced the log** (one 8xH100 node):
-  - Both took one Cut estimate from the same 50-update checkpoint and RNG. Cosine is 1.000000 on all 115 tensors,
-    at the same time per estimate (5.58 s) and peak memory (20.4 GB).
-  - The estimates aren't bit-equal: the largest relative difference is 1.7e-4. Each script differs that much from
-    its own repeat at the same RNG (1.9e-4), which is GPU nondeterminism.
-  - On CPU (fp32, compile off, a small config), one estimate, one full update and the generator states afterwards are
-    bit-equal. The model's state dict, initialization and forward pass are bit-equal at the record's size.
-- **A full run of this script** with the bare command (no flags) scored **3.21261** (`utils/eval.py` on its
-  `final.pt`: 3.21262) in 10,601.0 s, against the log's 3.21149 in 10,604.9 s. Its validations stayed within ±0.004 of
-  the log's, apart from +0.013 at update 625. Two runs of one configuration at 8 × 1024 ended 0.0015 apart, so +0.0011
-  is run-to-run noise. The PR keeps the original log as the record.
-- **One seed.** As the track asks: seed 0, a single run.
