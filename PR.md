@@ -1,6 +1,6 @@
 # Draft PR: track 2 (30M) record, 3.5 in ~23 s
 
-Draft text for a PR from `RobertTLange:track2-fused-cut` to `qlabs-eng/noise` `main` (not opened).
+Opened as qlabs-eng/noise#52 from `RobertTLange:track2-fused-cut`.
 
 **Title:** Track 2 (30M): 3.4976 in 22.9 s — #51's identity phase, then Cut with two single roots, fused Gluon chain kernels and overlapped bf16 collectives (seed 0, one 8xH100 node)
 
