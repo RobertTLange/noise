@@ -80,6 +80,8 @@ The time per Cut update fell from 72 ms (#51's recipe on our nodes) to 14.1 ms, 
 We got here over 67 internal records, each a single seed-0 fixed-length run on this track's rules. The time panel
 above shows them all; the milestones:
 
+![Train time per record](https://raw.githubusercontent.com/RobertTLange/noise/track2-fused-cut-figures/pr-progress.png)
+
 | # | Train time | Change |
 | --- | --- | --- |
 | 45 | 116.1 s | PR #51 with 32 query draws (our baseline run of #51) |
