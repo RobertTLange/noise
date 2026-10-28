@@ -9,7 +9,7 @@ Draft text for a PR from `RobertTLange:track2-fused-cut` to `qlabs-eng/noise` `m
 ## Result
 
 **3.49761 in 22.89 s** with seed 0 (the log in `train/speedrun/log/`). Against the current record (#44, 3.4988 in
-499.6 s, 8.3 min), that's ×21.8 faster. Against the open PR #51 that this builds on (3.4943 in 123.2 s), it's ×5.4.
+499.6 s, 8.3 min), that's ×21.8 faster. Against the open PR #51 by @conglu1997 that this builds on (3.4943 in 123.2 s), it's ×5.4.
 Identity phase 1.87 s, end merge 0.14 s.
 
 - **Command:** `uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py`, the default command with no
@@ -20,11 +20,11 @@ Identity phase 1.87 s, end merge 0.14 s.
 - **Timing spread:** the same code takes 22.7–23.2 s depending on the node and the time of day. The fastest internal
   run took 22.71 s (record #111 in the figures).
 
-![From PR #51 to this PR](https://raw.githubusercontent.com/RobertTLange/noise/track2-fused-cut-figures/pr-records.gif)
+![Train time per record, from PR #51 to this PR](https://raw.githubusercontent.com/RobertTLange/noise/track2-fused-cut-figures/pr-progress.png)
 
 ## What changed
 
-This builds on PR #51: a 300-update identity phase, then Cut with paired MLP roots. Each Cut update is one CUDA
+This builds on @conglu1997's PR #51: a 300-update identity phase, then Cut with paired MLP roots. Each Cut update is one CUDA
 graph. Here:
 
 1. **A different Cut estimator: two single roots.**
@@ -77,10 +77,8 @@ The time per Cut update fell from 72 ms (#51's recipe on our nodes) to 14.1 ms, 
 
 ## How we got here
 
-We got here over 67 internal records, each a single seed-0 fixed-length run on this track's rules. The time panel
-above shows them all; the milestones:
-
-![Train time per record](https://raw.githubusercontent.com/RobertTLange/noise/track2-fused-cut-figures/pr-progress.png)
+We got here over 67 internal records, each a single seed-0 fixed-length run on this track's rules. The figure at the
+top shows the milestones:
 
 | # | Train time | Change |
 | --- | --- | --- |
