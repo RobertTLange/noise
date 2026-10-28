@@ -2,20 +2,23 @@
 
 Draft text for a PR from `RobertTLange:track2-fused-cut` to `qlabs-eng/noise` `main` (not opened).
 
-**Title:** Track 2 (30M): 3.4989 in 22.7 s — #51's identity phase + Cut with two single roots, fused Gluon chain kernels and overlapped bf16 collectives (seed 0, one 8xH100 node)
+**Title:** Track 2 (30M): 3.4976 in 22.9 s — #51's identity phase, then Cut with two single roots, fused Gluon chain kernels and overlapped bf16 collectives (seed 0, one 8xH100 node)
 
 ---
 
 ## Result
 
-**3.49886 in 22.71 s** with seed 0 (the log in `train/speedrun/log/`; PR_LOG_NOTE). The current record (#44) is
-3.4988 in 499.6 s (8.3 min), so this is ×22 faster. It builds on the open PR #51 (3.4943 in 123.2 s), which is
-×5.4 slower than this. Identity phase 1.87 s, end merge 0.14 s.
+**3.49761 in 22.89 s** with seed 0 (the log in `train/speedrun/log/`). Against the current record (#44, 3.4988 in
+499.6 s, 8.3 min), that's ×21.8 faster. Against the open PR #51 that this builds on (3.4943 in 123.2 s), it's ×5.4.
+Identity phase 1.87 s, end merge 0.14 s.
 
 - **Command:** `uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py`, the default command with no
   flags.
-- **Hardware variance:** the same code runs in 22.7–23.2 s across our four 8xH100 nodes and over the day (±0.2 s).
-  Final val spreads ±0.0015 from run to run. 13 of 15 runs at this identity count passed.
+- **Run-to-run spread:** final val varies by about ±0.0015 between runs, about as much as the margin to the target.
+  Three runs of this exact code on three of our nodes gave 3.49761 (22.89 s), 3.49986 (22.92 s) and 3.50006 (22.73 s,
+  0.00006 above the target). Across the last code versions, 31 of 38 runs at 355 identity updates passed.
+- **Timing spread:** the same code takes 22.7–23.2 s depending on the node and the time of day. The fastest internal
+  run took 22.71 s (record #111 in the figures).
 
 ![From PR #51 to this PR](https://raw.githubusercontent.com/RobertTLange/noise/track2-fused-cut-figures/pr-records.gif)
 
