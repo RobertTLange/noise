@@ -1,30 +1,26 @@
 # Draft PR: track 2 (30M) record, 3.5 in ~14 s
 
-Draft, not opened. Code branch: `RobertTLange:track2-wide-cut`. Placeholders for the stripped script's final log are
-marked **TBD**.
+Draft, not opened. Code branch: `RobertTLange:track2-wide-cut` (`0736d61`).
 
-**Title:** Track 2 (30M): **TBD_VAL** in **TBD_TIME** s — 16-row Cut updates, root 4 on every 2nd update early,
+**Title:** Track 2 (30M): 3.4993 in 14.0 s — 16-row Cut updates, root 4 on every 2nd update early,
 tensor-core and Gluon credit kernels, per-head q/k polar and a scheduled update tail (seed 0, one 8xH100 node)
 
 ---
 
 ## Result
 
-**TBD_VAL in TBD_TIME s** with seed 0 (the log in `train/speedrun/log/`; `utils/eval.py` on its `final.pt`:
-TBD_EVAL). Against the current record (#52, 3.4976 in 22.9 s), that's ×TBD_SPEEDUP faster (the internal run below:
-22.89 / 13.89 = ×1.65). Identity phase TBD_ID s, end merge TBD_MERGE s.
+**3.49932 in 13.97 s** with seed 0 (the log in `train/speedrun/log/`). `utils/eval.py` on its `final.pt` gives the
+same 3.49932. Against the current record (#52, 3.4976 in 22.9 s), that's ×1.64 faster. Identity phase 1.33 s, end
+merge 0.07 s.
 
 - **Command:** `uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py`, the default command with no
   flags.
-- **Run-to-run spread:** the margin is thin, and most runs of this command miss the target by a little. Final val
-  varies by about ±0.0012 between runs of the same code. The record command (internal #182) passed in 1 of 7 runs:
-  3.49922, 3.50023, 3.50044, 3.50107, 3.50130, 3.50163 and 3.50173 (mean 3.5008). Its predecessors in the last round
-  passed in 1 of 2 to 1 of 5 runs. We spent each val gain on a wider root-4 window (below) until the command sat at the
-  line, so the speed comes with a low pass rate. A setting with more margin: the root-4 window at 10–65% instead of
-  10–70% passed 2 of 2 runs (3.49817, 3.49979) at 14.17–14.18 s, on the code with the per-head polar but before the joint
-  polar and the last scheduling changes.
-  The stripped script: TBD_PASS_COUNT.
-- **Timing spread:** the same code takes 13.88–13.94 s depending on the node.
+- **Run-to-run spread:** the margin is thin, and most runs of this code miss the target by a little. Final val
+  varies by about ±0.0012 between runs of the same code. This code passed in 3 of 12 runs, mean 3.50052. Of those, 8
+  were the plain command: 1 passed, mean 3.50085. The other 4 were screens of the same code through `--set`, and 2 of
+  them passed. We spent each val gain on a wider root-4 window (below) until the command sat at the line, so the speed
+  comes with a low pass rate.
+- **Timing spread:** the same code takes 13.96–14.02 s depending on the node.
 
 ![Train time per record, from PR #52 to this PR](https://raw.githubusercontent.com/RobertTLange/noise/track2-wide-cut-figures/pr-progress.png)
 
@@ -41,7 +37,7 @@ root 4's replay on half the updates in the first part of Cut.
    - **A native two-row estimate.** Each GPU estimates its two rows in one graph: capture, block recompute, route
      top-k, weight-credit GEMMs and the key / value kernels run on both rows at once. Each row keeps its own
      generators, so the draws match two one-row estimates. The two rows' chain replays run on two streams.
-   - **Root 4 on every 2nd update over 10–70% of Cut.** Root 4's replay (blocks 5–7 with the block-5 attention
+   - **Root 4 on every 2nd update over 10–65% of Cut.** Root 4's replay (blocks 5–7 with the block-5 attention
      replay) is the estimate's largest cost, ~40% of it. Inside the window it is replayed on every 2nd update, and
      its measured deviation from the identity-path prediction counts twice there. On the other updates root 4's
      credit is the identity-path prediction alone. Both estimate graphs are captured before the timer. The window
@@ -68,7 +64,8 @@ root 4's replay on half the updates in the first part of Cut.
 4. **The update.**
    - **Per-head polar for c_q / c_k**, from @CharlesDDDD's track-1 PR #54. ANVIL orthogonalizes each head's query and
      key rows together (one 128 × 512 polar per head) instead of each of c_q and c_k as one 512 × 512 matrix. On our
-     recipe this bought ~0.004 val for +0.07 s. We spent the val on the root-4 window (10–45% → 10–70%).
+     recipe this bought ~0.004 val for +0.07 s. We spent the val on the root-4 window: 10–45% → 10–70% internally,
+     10–65% here (see item 6).
    - ANVIL's weights and flat gradients are stored rank-major, so one reduce-scatter and one all-gather per update
      replace three of each. Each ANVIL unit is one CUDA graph, and the units overlap on two streams.
    - The next replay's inputs are staged under the previous update's tail. The gate-row prefetch is a graph on a
@@ -86,18 +83,23 @@ root 4's replay on half the updates in the first part of Cut.
      to Cut has no host sync. 355 updates now take 1.33 s (#52: 1.87 s).
 6. **The end merge, fit in the run.** Each of the 57 parts (one per weight matrix and the embeddings) gets its own
    coefficient a in w + a·(avg − w) toward the 0.02 weight average, in place of one coefficient for all. The parts
-   are split over the 8 ranks. Each rank probes its parts at a = 0.75 ± 0.5 on 24 identity-phase rows (one forward
-   from the part's first block) and fits a parabola per part. One all-reduce shares the vertices (clipped to
-   −0.25…1.25). The joint move is shrunk by the best of 0.25 / 0.5 / 0.75 on the 64 held-out rows. This is the
-   in-run form of the per-part merge in the closed #53 by @areu01or00, whose table was fit offline. It keeps 60–80%
-   of #53's offline gain (−0.002 to −0.003 val). Merge 0.15 s.
+   are split over the 8 ranks. Each rank probes its parts at a = 0.75 ± 0.5 on its 8 of the 64 held-out rows (one
+   forward from the part's first block) and fits a parabola per part. One all-reduce shares the vertices (clipped
+   to −0.25…1.25). The joint move is shrunk by the best of 0.25 / 0.5 / 0.75 on all 64 held-out rows. No row that
+   fed an update is read again. This is the in-run form of the per-part merge in the closed #53 by @areu01or00,
+   whose table was fit offline. Merge 0.07 s.
+   - Our internal records #116–#182 fit the parabolas on 24 identity-phase rows per rank, rows that had already fed
+     an update. There the in-run fit kept 60–80% of #53's offline gain (−0.002 to −0.003 val).
+   - Fitting on the held-out rows only makes the fits noisier and cost ~+0.0012 val (4 runs: mean 3.50153 at
+     10–70%). We paid that back with a narrower root-4 window, 10–65% instead of 10–70%, for ~+0.13 s. Hence
+     13.97 s here against 13.89 s for internal #182.
 
-The time per Cut row fell from 1.76 ms (#52) to 1.06 ms. That is 12.4 s for Cut's 11,744 rows, against 20.7 s.
+The time per Cut row fell from 1.76 ms (#52) to 1.07 ms. That is 12.6 s for Cut's 11,744 rows, against 20.7 s.
 
 ## How we got here
 
-We got here over 71 internal records (#112–#182), each a single seed-0 fixed-length run on this track's rules. The
-figure at the top shows the milestones:
+We got here over 71 internal records (#112–#182), each a single seed-0 fixed-length run, then this PR's
+held-out-only merge. The figure at the top shows the milestones:
 
 | # | Train time | Change |
 | --- | --- | --- |
@@ -115,7 +117,8 @@ figure at the top shows the milestones:
 | 171 | 14.75 s | update-tail scheduling (rank-major ANVIL, overlapped units, staged inputs) |
 | 176 | 14.18 s | per-head q/k polar (PR #54), root-4 window 10–65% |
 | 180 | 13.97 s | joint q/k polar per head, root-4 window 10–70% |
-| 182 | 13.89 s | identity phase overlapped, NCCL LL128 |
+| 182 | 13.89 s | identity phase overlapped, NCCL LL128 (merge fit on identity rows) |
+| PR | 13.97 s | merge fit on held-out rows only, root-4 window 10–65% |
 
 **What didn't work:**
 - **Cheaper root estimates.** We tried token subsets, row subsets, frame subsets, importance-sampled tokens, control
@@ -175,8 +178,8 @@ per-tensor cosine 1.000000.
 - **Fixed model and data.**
   - The final weights load strictly into `utils/model.py`.
   - Each training sequence feeds at most one update. A 16-row update uses each of its rows once.
-  - The merge's coefficient fit runs forwards on 24 identity-phase rows per rank, which had already fed their
-    identity update, and picks the shrink on the 64 held-out rows that feed no update.
+  - The end merge fits its coefficients and picks its shrink only on the 64 held-out rows, which feed no update.
+    Every other row feeds exactly one update (2,840 identity + 11,744 Cut + 64 held-out = 14,648).
 - **Timing.**
   - One `torchrun train/speedrun/run.py` process (helper kernel files next to it) and one timed region, from the first
     identity update to the end of the merge.
@@ -192,4 +195,4 @@ uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py
 ```
 
 torch 2.10.0 (cu128), Triton 3.6 (Gluon kernels: Hopper / sm_90 only). The switches are `Settings` fields and
-module constants with the record's values as defaults. Script: TBD_LINES lines (#52: 2,928).
+module constants with the record's values as defaults. `run.py` is 4,458 lines (#52: 2,928).
