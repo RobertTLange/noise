@@ -1,6 +1,6 @@
 # Draft PR: track 2 (30M) record, 3.5 in ~14 s
 
-Draft, not opened. Code branch: `RobertTLange:track2-wide-cut` (`0736d61`).
+Opened as qlabs-eng/noise#56. Code branch: `RobertTLange:track2-wide-cut` (`0736d61`).
 
 **Title:** Track 2 (30M): 3.4993 in 14.0 s — 16-row Cut updates, root 4 on every 2nd update early,
 tensor-core and Gluon credit kernels, per-head q/k polar and a scheduled update tail (seed 0, one 8xH100 node)
