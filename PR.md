@@ -1,26 +1,39 @@
-# Draft PR: track 2 (30M) record, 3.5 in ~14 s
+# Draft PR: track 2 (30M) record, 3.5 in ~14.2 s
 
-Opened as qlabs-eng/noise#56. Code branch: `RobertTLange:track2-wide-cut` (`0736d61`).
+Opened as qlabs-eng/noise#56. Code branch: `RobertTLange:track2-wide-cut` (`7755140`, on main `8eb5c6d`).
 
-**Title:** Track 2 (30M): 3.4993 in 14.0 s — 16-row Cut updates, root 4 on every 2nd update early,
+**Title:** Track 2 (30M): 3.4965 in 14.2 s — 16-row Cut updates, root 4 on every 2nd update early,
 tensor-core and Gluon credit kernels, per-head q/k polar and a scheduled update tail (seed 0, one 8xH100 node)
 
 ---
 
 ## Result
 
-**3.49932 in 13.97 s** with seed 0 (the log in `train/speedrun/log/`). `utils/eval.py` on its `final.pt` gives the
-same 3.49932. Against the current record (#52, 3.4976 in 22.9 s), that's ×1.64 faster. Identity phase 1.33 s, end
-merge 0.07 s.
+**3.49652 in 14.24 s** with seed 0 (the log in `train/speedrun/log/`). `utils/eval.py` on its `final.pt` gives
+3.4965175 (3.496517492 against the run's 3.496517548). Against the current record (#55, 3.4959 in 15.9 s), that's
+×1.12 faster. Identity phase 1.18 s, end merge 0.15 s.
 
 - **Command:** `uv run torchrun --standalone --nproc_per_node=8 train/speedrun/run.py`, the default command with no
   flags.
-- **Run-to-run spread:** the margin is thin, and most runs of this code miss the target by a little. Final val
-  varies by about ±0.0012 between runs of the same code. This code passed in 3 of 12 runs, mean 3.50052. Of those, 8
-  were the plain command: 1 passed, mean 3.50085. The other 4 were screens of the same code through `--set`, and 2 of
-  them passed. We spent each val gain on a wider root-4 window (below) until the command sat at the line, so the speed
-  comes with a low pass rate.
-- **Timing spread:** the same code takes 13.96–14.02 s depending on the node.
+- **Every run passes.** 16 runs of that command on three nodes, all ≤ 3.5:
+
+  | Runs | Final val |
+  | --- | --- |
+  | 1–8 | 3.49669, 3.49679, 3.49761, 3.49530, 3.49736, 3.49592, 3.49749, 3.49625 |
+  | 9–16 | 3.49653, 3.49597, 3.49647, 3.49633, 3.49834, 3.49652, 3.49723, 3.49517 |
+
+  Mean 3.49662 ± 0.00084 (std), min 3.49517, max 3.49834, median 3.49652. One-sided t-test against 3.5: t = −16.0,
+  p = 4e-11. Train time 14.22–14.28 s (median 14.24 s); the node sets most of the spread. The log is the median run
+  (3.49652, 14.24 s), not the best one. Runs 13–16 ran this exact tree; runs 1–12 ran a tree that differs only in a
+  description string written to `row_usage.json`.
+- **What changed since the first version of this PR.** The first version averaged 3.50052 over 12 runs (3 of them
+  ≤ 3.5) at 13.96–14.02 s. Two changes bought a clear margin for +0.28 s:
+  - The merge fits its per-part parabolas on 24 of the 64 held-out rows per rank instead of 8 (a window starting at
+    row 8 · rank, so the ranks' windows overlap): −0.0006 val for +0.08 s. More rows didn't help further: 32 rows
+    per rank gave the same val, 64 gave none of it and cost +0.3 s.
+  - The identity phase hands off to Cut after 315 updates instead of 355, so Cut gets 320 more rows: −0.003 val for
+    +0.19 s. This was the cheapest lever we measured (~0.015 val per s). Ending the root-4 window earlier instead
+    (10–55%) gave ~0.006 val per s.
 
 ![Train time per record, from PR #52 to this PR](https://raw.githubusercontent.com/RobertTLange/noise/track2-wide-cut-figures/pr-progress.png)
 
@@ -32,7 +45,7 @@ root 4's replay on half the updates in the first part of Cut.
 
 1. **Estimator and schedule.**
    - **16-row Cut updates.** From 10% of Cut's rows on, an update takes 16 rows (two per GPU), with one gradient
-     exchange and one optimizer step, at rates ×1.3. Cut runs 148 updates of 8 rows, then 660 of 16 (#52: 1,468 of
+     exchange and one optimizer step, at rates ×1.3. Cut runs 152 updates of 8 rows, then 678 of 16 (#52: 1,468 of
      8). Same rows, same order.
    - **A native two-row estimate.** Each GPU estimates its two rows in one graph: capture, block recompute, route
      top-k, weight-credit GEMMs and the key / value kernels run on both rows at once. Each row keeps its own
@@ -42,8 +55,8 @@ root 4's replay on half the updates in the first part of Cut.
      its measured deviation from the identity-path prediction counts twice there. On the other updates root 4's
      credit is the identity-path prediction alone. Both estimate graphs are captured before the timer. The window
      started as the first 20% of Cut and widened as other changes bought val.
-   - Structured start ρ 0.9 (0.8). The identity phase's rates decay over its last 150 updates to 0.3. Warmdown over
-     the last 55% of Cut (50%).
+   - The identity phase hands off after 315 updates (#52: 355), and its rates decay over its last 150 updates to
+     0.3. Structured start ρ 0.9 (0.8). Warmdown over the last 55% of Cut (50%).
 2. **Kernels.**
    - Chain kernels on tensor cores: the gate dots and readout moments as wgmmas, packed bf16 converts, 128-move tiles
      in the block-4 tail kernel (64). The tail forms its replay response once per chunk, and the readout sums stay
@@ -80,21 +93,23 @@ root 4's replay on half the updates in the first part of Cut.
      phase keeps its memory cache for Cut, and an 8 GB block is allocated and freed before the timer.
    - Identity phase: leaner kernels, its gradient GEMMs read the layer inputs in place, value-embedding shaping in
      closed form. Its reduce-scatter goes out early, and its all-gathers run on a second communicator. The hand-off
-     to Cut has no host sync. 355 updates now take 1.33 s (#52: 1.87 s).
+     to Cut has no host sync. Its 315 updates take 1.18 s (#52: 355 in 1.87 s; 355 take 1.33 s here).
 6. **The end merge, fit in the run.** Each of the 57 parts (one per weight matrix and the embeddings) gets its own
    coefficient a in w + a·(avg − w) toward the 0.02 weight average, in place of one coefficient for all. The parts
-   are split over the 8 ranks. Each rank probes its parts at a = 0.75 ± 0.5 on its 8 of the 64 held-out rows (one
-   forward from the part's first block) and fits a parabola per part. One all-reduce shares the vertices (clipped
-   to −0.25…1.25). The joint move is shrunk by the best of 0.25 / 0.5 / 0.75 on all 64 held-out rows. No row that
+   are split over the 8 ranks. Each rank probes its parts at a = 0.75 ± 0.5 on 24 of the 64 held-out rows (rows
+   8·rank to 8·rank + 23, wrapping; one forward from the part's first block) and fits a parabola per part. One
+   all-reduce shares the vertices (clipped to −0.25…1.25). The joint move is shrunk by the best of 0.25 / 0.5 / 0.75 on all 64 held-out rows. No row that
    fed an update is read again. This is the in-run form of the per-part merge in the closed #53 by @areu01or00,
-   whose table was fit offline. Merge 0.07 s.
+   whose table was fit offline. Merge 0.15 s.
    - Our internal records #116–#182 fit the parabolas on 24 identity-phase rows per rank, rows that had already fed
      an update. There the in-run fit kept 60–80% of #53's offline gain (−0.002 to −0.003 val).
-   - Fitting on the held-out rows only makes the fits noisier and cost ~+0.0012 val (4 runs: mean 3.50153 at
-     10–70%). We paid that back with a narrower root-4 window, 10–65% instead of 10–70%, for ~+0.13 s. Hence
-     13.97 s here against 13.89 s for internal #182.
+   - Fitting on held-out rows only, 8 per rank, made the fits noisier and cost ~+0.0012 val (4 runs: mean 3.50153 at
+     10–70%). 24 rows per rank win back about half of it (−0.0006 for +0.08 s). The rest of the margin comes from
+     a narrower root-4 window, 10–65% instead of 10–70% (~+0.13 s), and the identity hand-off at 315 updates
+     (+0.19 s). Hence 14.24 s here against 13.89 s for internal #182.
 
-The time per Cut row fell from 1.76 ms (#52) to 1.07 ms. That is 12.6 s for Cut's 11,744 rows, against 20.7 s.
+The time per Cut row fell from 1.76 ms (#52) to 1.07 ms. That is 12.9 s for Cut's 12,064 rows; #52 took 20.7 s for
+its 11,744.
 
 ## How we got here
 
@@ -118,7 +133,7 @@ held-out-only merge. The figure at the top shows the milestones:
 | 176 | 14.18 s | per-head q/k polar (PR #54), root-4 window 10–65% |
 | 180 | 13.97 s | joint q/k polar per head, root-4 window 10–70% |
 | 182 | 13.89 s | identity phase overlapped, NCCL LL128 (merge fit on identity rows) |
-| PR | 13.97 s | merge fit on held-out rows only, root-4 window 10–65% |
+| PR | 14.24 s | merge fit on held-out rows only (24 per rank), root-4 window 10–65%, identity hand-off at 315 |
 
 **What didn't work:**
 - **Cheaper root estimates.** We tried token subsets, row subsets, frame subsets, importance-sampled tokens, control
@@ -145,14 +160,16 @@ held-out-only merge. The figure at the top shows the milestones:
   per estimate. Applying each update one step late cost +0.03 val. AdamW on a side stream lost ~0.5 ms per update to
   all-gather waits. The bf16 key scan cost val margin and was dropped.
 
-**Concurrent work:** @CharlesDDDD's open #55 (3.4959 in 15.9 s, opened 2026-11-01) also starts from #52, and was
-developed independently. Some of its ideas overlap with ours:
+**#55:** @CharlesDDDD's #55 (3.4959 in 15.9 s), merged on 2026-11-02, is the current record. It also starts from #52
+and was developed independently of this PR. Some of its ideas overlap with ours:
 - Its root 6 replays along each token's routed span (128 moves, a per-token CG solve). That is close to our exact
   subspace roots above, which we found time-neutral at our kernel speeds.
 - Its 16-row updates (from half of Cut), ANVIL in CUDA graphs and gate rows drawn on a side stream match changes here.
 - Its token-subset root 4, word-mix row pruning, fixed end merge and kernels are different from what is here.
 
-We haven't tried combining the two.
+This PR is rebased onto main with #55, but its `train/speedrun/` is this lineage from #52: it replaces #55's
+`run.py` and kernels, and removes the helper files only #55's script imported (`implicit_ws.py`, `key_scan_ws.py`,
+`moment_queries_ws.py`, `span_solve.py`, `value_credit_ws.py`). We haven't tried combining the two.
 
 ## Exactness
 
@@ -179,7 +196,7 @@ per-tensor cosine 1.000000.
   - The final weights load strictly into `utils/model.py`.
   - Each training sequence feeds at most one update. A 16-row update uses each of its rows once.
   - The end merge fits its coefficients and picks its shrink only on the 64 held-out rows, which feed no update.
-    Every other row feeds exactly one update (2,840 identity + 11,744 Cut + 64 held-out = 14,648).
+    Every other row feeds exactly one update (2,520 identity + 12,064 Cut + 64 held-out = 14,648).
 - **Timing.**
   - One `torchrun train/speedrun/run.py` process (helper kernel files next to it) and one timed region, from the first
     identity update to the end of the merge.
