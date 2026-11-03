@@ -98,9 +98,9 @@ root 4's replay on half the updates in the first part of Cut.
    coefficient a in w + a·(avg − w) toward the 0.02 weight average, in place of one coefficient for all. The parts
    are split over the 8 ranks. Each rank probes its parts at a = 0.75 ± 0.5 on 24 of the 64 held-out rows (rows
    8·rank to 8·rank + 23, wrapping; one forward from the part's first block) and fits a parabola per part. One
-   all-reduce shares the vertices (clipped to −0.25…1.25). The joint move is shrunk by the best of 0.25 / 0.5 / 0.75 on all 64 held-out rows. No row that
-   fed an update is read again. This is the in-run form of the per-part merge in the closed #53 by @areu01or00,
-   whose table was fit offline. Merge 0.15 s.
+   all-reduce shares the vertices (clipped to −0.25…1.25). The joint move is shrunk by the best of 0.25 / 0.5 /
+   0.75 on all 64 held-out rows. No row that fed an update is read again. This is the in-run form of the per-part
+   merge in the closed #53 by @areu01or00, whose table was fit offline. Merge 0.15 s.
    - Our internal records #116–#182 fit the parabolas on 24 identity-phase rows per rank, rows that had already fed
      an update. There the in-run fit kept 60–80% of #53's offline gain (−0.002 to −0.003 val).
    - Fitting on held-out rows only, 8 per rank, made the fits noisier and cost ~+0.0012 val (4 runs: mean 3.50153 at
